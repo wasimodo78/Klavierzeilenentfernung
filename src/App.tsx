@@ -1,6 +1,8 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { UploadCloud, Loader2, Download, Eye, ArrowLeft, Layout, List } from 'lucide-react';
-import { generatePdf, ExtractedSystem, groupSystemsIntoPages } from './utils/pdfProcessor';
+import { generatePdf, ExtractedSystem, groupSystemsIntoPages, layoutSize, PAGE_LAYOUT } from './utils/pdfProcessor';
+
+const CONTENT_WIDTH_MM = PAGE_LAYOUT.A4_WIDTH_MM - 2 * PAGE_LAYOUT.MARGIN_MM;
 import { analyzePdfVectors } from './utils/vectorAnalyzer';
 import { analyzePixels } from './utils/cvAnalyzer';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -63,6 +65,7 @@ export default function App() {
         const unscaledViewport = page.getViewport({ scale: 1.0 });
         const scale = 2480 / unscaledViewport.width;
         const viewport = page.getViewport({ scale });
+        const mmPerPx = (unscaledViewport.width * 25.4 / 72) / viewport.width;
         const canvas = document.createElement('canvas');
         canvas.width = viewport.width;
         canvas.height = viewport.height;
@@ -84,9 +87,9 @@ export default function App() {
 
         const { croppedStrips, debugImage, stats } = await analyzePixels(canvas, (msg) => {
           setProgressMsg(`Seite ${i}: ${msg}`);
-        }, i, { canvas: outCanvas ?? canvas, bilevel: outputMode !== 'foto300' });
+        }, i, { canvas: outCanvas ?? canvas, bilevel: outputMode !== 'foto300', mmPerPx });
 
-        allStrips.push(...croppedStrips.map(s => ({ dataUrl: s.dataUrl, width: s.width, height: s.height })));
+        allStrips.push(...croppedStrips.map(s => ({ dataUrl: s.dataUrl, width: s.width, height: s.height, widthMm: s.widthMm, heightMm: s.heightMm })));
         allDebug.push({ image: debugImage, stats });
       }
 
@@ -508,7 +511,8 @@ export default function App() {
                         <img 
                           src={img.dataUrl} 
                           alt={`System ${idx + 1}`} 
-                          className="w-full h-auto object-contain"
+                          className="h-auto object-contain"
+                          style={{ width: `${(layoutSize(img).wMm / CONTENT_WIDTH_MM) * 100}%` }}
                         />
                       </div>
                     ))}
@@ -521,12 +525,13 @@ export default function App() {
                           Seite {pageIdx + 1}
                         </div>
                         <div className="w-full h-full flex flex-col gap-[3.8%]">
-                           {page.map((img, sysIdx) => (
+                           {page.map((item, sysIdx) => (
                              <img 
                                key={sysIdx}
-                               src={img.dataUrl}
+                               src={item.img.dataUrl}
                                alt={`Seite ${pageIdx + 1} - System ${sysIdx + 1}`}
-                               className="w-full object-contain object-top"
+                               className="object-contain object-top"
+                               style={{ width: `${(item.wMm / CONTENT_WIDTH_MM) * 100}%` }}
                              />
                            ))}
                         </div>

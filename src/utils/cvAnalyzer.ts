@@ -2,14 +2,16 @@ export async function analyzePixels(
   canvas: HTMLCanvasElement,
   onProgress: (msg: string) => void,
   pageIndex: number = 1,
-  output?: { canvas: HTMLCanvasElement; bilevel: boolean }
-): Promise<{ debugImage: string, stats: string, croppedStrips: { dataUrl: string, height: number, width: number }[] }> {
+  output?: { canvas: HTMLCanvasElement; bilevel: boolean; mmPerPx?: number }
+): Promise<{ debugImage: string, stats: string, croppedStrips: { dataUrl: string, height: number, width: number, widthMm: number, heightMm: number }[] }> {
   onProgress("Starte Bildanalyse (Binarisierung)...");
   const ctx = canvas.getContext('2d')!;
   // Ausgabe erfolgt optional aus einem separaten hochauflösenden Render
   const outCanvas = output?.canvas ?? canvas;
   const outScale = outCanvas.width / canvas.width;
   const outBilevel = output?.bilevel ?? false;
+  // echter Millimeter-Maßstab pro Analyse-Pixel (für Originalgröße im Layout)
+  const mmPerPx = output?.mmPerPx ?? (210 / canvas.width);
   const width = canvas.width;
   const height = canvas.height;
   const imgData = ctx.getImageData(0, 0, width, height);
@@ -401,7 +403,7 @@ export async function analyzePixels(
   // Nicht-Klavier-Systemen zusammenhängende Keep-Segmente. Klavier-Läufe
   // (geschweifte Klammer) fallen so auch mitten auf der Seite als Lücke heraus –
   // unabhängig davon, wie die Akkolade-Gruppierung ausgefallen ist.
-  const croppedStrips: { dataUrl: string, height: number, width: number }[] = [];
+  const croppedStrips: { dataUrl: string, height: number, width: number, widthMm: number, heightMm: number }[] = [];
   let keepRegionsStats = '';
 
   if (staves.length > 0) {
@@ -616,7 +618,10 @@ export async function analyzePixels(
       croppedStrips.push({
         dataUrl: outBilevel ? stripCanvas.toDataURL('image/png') : stripCanvas.toDataURL('image/jpeg', 0.92),
         height: outH,
-        width: outW
+        width: outW,
+        // Naturmaße in Millimetern (unabhängig von der Ausgabe-Auflösung)
+        widthMm: (outW / outScale) * mmPerPx,
+        heightMm: (outH / outScale) * mmPerPx
       });
 
       // Rote Schnittlinien an Ober-/Unterkante im Debug-Bild
