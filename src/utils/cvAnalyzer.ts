@@ -479,6 +479,7 @@ export async function analyzePixels(
     const ZONE_COVERAGE = 0.25;           // mind. 25% der Zone mit Text bedeckt
     const BOTTOM_GATE = 0.7;              // untere 30% der Seite: kein neuer Titel
     const COPYRIGHT_MIN_W_FRAC = 0.35;    // breite, flache Zeile = Copyright
+    const ZONE_MIN_W_FRAC = 0.22;         // Titelzone: mind. eine Zeile so breit (% Seitenbreite)
     const findMergedClusters = (yFrom: number, yTo: number): ContentCluster[] => {
       const maxGap = globalAvgSpatium * MERGE_GAP_SP;
       const fine = findContentClusters(yFrom, yTo);
@@ -514,6 +515,11 @@ export async function analyzePixels(
     const isDisplayTitle = (cl: ContentCluster) =>
       cl.size >= globalAvgSpatium * DISPLAY_BLOCK_SP && cl.maxLine >= globalAvgSpatium * DISPLAY_LINE_SP &&
       clusterWidth(cl) >= globalAvgSpatium * 8; // breit! Uebungszeichen-Kaestchen sind schmal (~3-5 Spatia)
+
+    // Eine echte Titelzone hat irgendeine breite Zeile (Titel/Untertitel/Absatz);
+    // Kästchen+Dynamik-Paeckchen im Graben sind nur 2-5% breit.
+    const hasWideLine = (clusters: ContentCluster[]) =>
+      clusters.some(cl => clusterWidth(cl) >= width * ZONE_MIN_W_FRAC);
 
     const isWideShallowLine = (cl: ContentCluster, maxHsp: number, staffSpanX: number) =>
       cl.start >= height * BOTTOM_GATE &&
@@ -573,7 +579,7 @@ export async function analyzePixels(
           // Dicht gepackte Textzone (viel Text auf engem Raum) = Titelvorspann;
           // vereinzelte Kopf-/Tempozeilen mit grossen Abständen dagegen nicht
           const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
-            ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE) || headClusters.some(isDisplayTitle));
+            ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters)) || headClusters.some(isDisplayTitle));
           if (isPieceHead) {
             newPiece = true;
             segTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
@@ -590,7 +596,7 @@ export async function analyzePixels(
         const gatedByPosition = gapClusters.length > 0 && gapStart < height * BOTTOM_GATE;
         const sumH = gapClusters.reduce((s, cl) => s + cl.size, 0);
         const coverage = gapSpan > 0 ? sumH / gapSpan : 0;
-        const zoneTitle = gatedByPosition && sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE;
+        const zoneTitle = gatedByPosition && gapClusters.length > 0 && sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(gapClusters);
         const displayCluster = gatedByPosition ? gapClusters.find(isDisplayTitle) : undefined;
         const titleStart = zoneTitle ? gapStart : (displayCluster ? displayCluster.start : null);
 
@@ -659,7 +665,7 @@ export async function analyzePixels(
       const sumH = headClusters.reduce((s, cl) => s + cl.size, 0);
       const coverage = headSpan > 0 ? sumH / headSpan : 0;
       const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
-        ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE) || headClusters.some(isDisplayTitle));
+        ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters)) || headClusters.some(isDisplayTitle));
       if (isPieceHead) {
         const fTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
         const fBottom = Math.min(height, Math.floor(staves[0].y1 - globalAvgSpatium));
