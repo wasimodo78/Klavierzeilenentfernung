@@ -12,6 +12,65 @@ import { restoreScanImage, downscale, RestoredPage, ScanDebug } from './utils/sc
 import { jsPDF } from 'jspdf';
 import * as pdfjsLib from 'pdfjs-dist';
 
+const safeCaptureName = (name: string) => name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+
+const canvasToBlob = (canvas: HTMLCanvasElement, type = 'image/png', quality?: number) =>
+  new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error('Canvas konnte nicht serialisiert werden')), type, quality);
+  });
+
+const dataUrlToBlob = async (dataUrl: string) => {
+  const res = await fetch(dataUrl);
+  return await res.blob();
+};
+
+async function postScanCapture(session: string, name: string, body: Blob | string): Promise<string | null> {
+  try {
+    const payload = typeof body === 'string' ? new Blob([body], { type: 'application/json' }) : body;
+    const resp = await fetch(`/api/scan-capture?session=${encodeURIComponent(session)}&name=${encodeURIComponent(safeCaptureName(name))}`, {
+      method: 'POST',
+      body: payload,
+    });
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    return json.dir ?? null;
+  } catch {
+    // Kein Dev-Server / statisches Hosting: Diagnose-Sicherung still überspringen.
+    return null;
+  }
+}
+
+async function captureRestoredPages(session: string, pages: RestoredPage[], sourceLabel: string): Promise<string | null> {
+  let dir: string | null = null;
+  for (let i = 0; i < pages.length; i++) {
+    const pageNo = String(i + 1).padStart(2, '0');
+    const png = await canvasToBlob(pages[i].canvas, 'image/png');
+    dir = await postScanCapture(session, `${pageNo}_result_${safeCaptureName(sourceLabel)}.png`, png) ?? dir;
+
+    const debug = pages[i].debug;
+    const debugJson = JSON.stringify({
+      sourceLabel,
+      pageIndex: i + 1,
+      orientationVotes: debug.orientationVotes,
+      fineAngleDeg: debug.fineAngleDeg,
+      split: debug.split,
+      splitColumnX: debug.splitColumnX,
+      splitEvidence: debug.splitEvidence,
+      stageLabels: debug.stageImages.map(s => s.label),
+    }, null, 2);
+    dir = await postScanCapture(session, `${pageNo}_debug.json`, debugJson) ?? dir;
+
+    for (let s = 0; s < debug.stageImages.length; s++) {
+      const stage = debug.stageImages[s];
+      if (!stage.dataUrl) continue;
+      const blob = await dataUrlToBlob(stage.dataUrl);
+      const ext = stage.dataUrl.startsWith('data:image/jpeg') ? 'jpg' : 'png';
+      dir = await postScanCapture(session, `${pageNo}_stage_${String(s + 1).padStart(2, '0')}_${safeCaptureName(stage.label)}.${ext}`, blob) ?? dir;
+    }
+  }
+  return dir;
+}
+
 export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progressMsg, setProgressMsg] = useState('');
@@ -33,6 +92,7 @@ export default function App() {
   const [scanMode, setScanMode] = useState<'zuschneiden' | 'restaurieren'>('zuschneiden');
   const [restored, setRestored] = useState<RestoredPage[] | null>(null);
   const [restoreDebug, setRestoreDebug] = useState<ScanDebug[] | null>(null);
+  const [scanCapturePath, setScanCapturePath] = useState<string | null>(null);
 
   const previewPages = useMemo(() => {
     if (!previewImages) return [];
@@ -362,27 +422,36 @@ export default function App() {
   const handleScanInput = async (files: File[]) => {
     setRestored(null);
     setRestoreDebug(null);
+    setScanCapturePath(null);
     setCurrentFile(files[0] ?? null);
     setIsProcessing(true);
     setProgressMsg('Restauriere Scan(s)...');
     setProgressPct(0);
 
+    const captureSession = `scan_${new Date().toISOString().replace(/[:.]/g, '-')}_${safeCaptureName(files[0]?.name ?? 'input')}`;
+
     try {
       const outRestored: RestoredPage[] = [];
       const outDebug: ScanDebug[] = [];
-      let inputCount = 0;
 
-      const processCanvas = async (canvas: HTMLCanvasElement, label: string, base: number, total: number) => {
+      const noteCaptureDir = (dir: string | null) => {
+        if (dir) setScanCapturePath(dir);
+      };
+
+      const processCanvas = async (canvas: HTMLCanvasElement, label: string) => {
         setProgressMsg(`${label}: Vermesse, entzerre & separiere Schwarz-Weiß...`);
         const pages = await restoreScanImage(canvas);
         outRestored.push(...pages);
-        pages.forEach(() => outDebug.push(pages[0].debug));
+        pages.forEach((p) => outDebug.push(p.debug));
+        setProgressMsg(`${label}: Speichere Diagnosepaket...`);
+        noteCaptureDir(await captureRestoredPages(captureSession, pages, label));
       };
 
       for (let k = 0; k < files.length; k++) {
         const f = files[k];
         const label = `Quelle ${k + 1}/${files.length} (${f.name})`;
         setProgressPct(10 + (k / files.length) * 80);
+        noteCaptureDir(await postScanCapture(captureSession, `00_input_${k + 1}_${f.name}`, f));
         if (f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')) {
           const arrayBuffer = await f.arrayBuffer();
           const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
@@ -395,7 +464,7 @@ export default function App() {
             const canvas = document.createElement('canvas');
             canvas.width = viewport.width; canvas.height = viewport.height;
             await page.render({ canvasContext: canvas.getContext('2d')!, viewport }).promise;
-            await processCanvas(canvas, label + ` Seite ${i}`, 0, files.length);
+            await processCanvas(canvas, label + ` Seite ${i}`);
             page.cleanup();
             canvas.width = 0; canvas.height = 0;
           }
@@ -405,7 +474,7 @@ export default function App() {
           canvas.width = bmp.width; canvas.height = bmp.height;
           canvas.getContext('2d')!.drawImage(bmp, 0, 0);
           bmp.close();
-          await processCanvas(canvas, label, 0, files.length);
+          await processCanvas(canvas, label);
         }
         setMainDebug([]);
       }
@@ -477,9 +546,9 @@ export default function App() {
         
         {/* Header */}
         <div className="bg-indigo-600 px-8 py-8 text-center relative">
-          {(previewImages || debugOutputs.length > 0 || cvDebugImages.length > 0 || cvCroppedImages.length > 0) && !isProcessing && (
+          {(previewImages || restored || debugOutputs.length > 0 || cvDebugImages.length > 0 || cvCroppedImages.length > 0) && !isProcessing && (
             <button 
-              onClick={() => { setPreviewImages(null); setDebugOutputs([]); setCvDebugImages([]); setCvCroppedImages([]);
+              onClick={() => { setPreviewImages(null); setRestored(null); setRestoreDebug(null); setScanCapturePath(null); setDebugOutputs([]); setCvDebugImages([]); setCvCroppedImages([]);
     setMainDebug([]);
     setDownload(null);
     setServerUrl(null);
@@ -688,6 +757,13 @@ export default function App() {
                   PDF Exportieren (restauriert)
                 </button>
               </div>
+
+              {scanCapturePath && (
+                <div className="mb-6 bg-sky-50 border border-sky-200 rounded-xl px-4 py-3 text-sm text-sky-800">
+                  <p className="font-semibold">Diagnosepaket für die Agent-Feedbackschlaufe gespeichert:</p>
+                  <code className="block mt-1 text-xs bg-white/70 border border-sky-100 rounded px-2 py-1 overflow-x-auto">{scanCapturePath}</code>
+                </div>
+              )}
 
               <div className="space-y-10">
                 {restored.map((p, idx) => (

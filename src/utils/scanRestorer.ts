@@ -575,16 +575,38 @@ function conservativeClean(bin: Uint8Array, w: number, h: number): Uint8Array {
   return out;
 }
 
+type BinarizePreset = 'strict' | 'balanced' | 'sensitive';
+
+type BinarizeProfile = {
+  sauvolaK: number;
+  dropFrac: number;
+  minDrop: number;
+  maxDrop: number;
+  bias: number;
+  bridgeFactor: number;
+};
+
+const BINARIZE_PROFILES: Record<BinarizePreset, BinarizeProfile> = {
+  // Sehr sauberer Druck: lieber Papier wirklich weiss lassen; gut gegen Fotoschatten/JPEG-Matsch.
+  strict: { sauvolaK: 0.34, dropFrac: 0.078, minDrop: 17, maxDrop: 32, bias: -2, bridgeFactor: 0.00055 },
+  // Standard für Ausgabe: konservativer als die vorige Version, aber dünne Linien bleiben erhalten.
+  balanced: { sauvolaK: 0.26, dropFrac: 0.060, minDrop: 12, maxDrop: 24, bias: 2, bridgeFactor: 0.00065 },
+  // Diagnose/Notfall bei sehr blasser Tinte: mehr retten, kann Papierkorn eher mitnehmen.
+  sensitive: { sauvolaK: 0.18, dropFrac: 0.046, minDrop: 9, maxDrop: 19, bias: 6, bridgeFactor: 0.00075 },
+};
+
 /**
  * Finale Schwarz-Weiss-Separation für Musikscans.
  *
- * Das ist bewusst NICHT ein globaler Schwellenwert: Pro Pixel wird eine lokale
- * Sauvola-Schwelle (Mittelwert/Standardabweichung im Fenster) mit einer lokalen
- * Papierweiss-Schätzung kombiniert. Dadurch bleiben dünne Notenlinien in
- * Schattenbereichen erhalten, während Beleuchtungsverläufe weiss bleiben.
- * Ausgabe ist echtes bilevel: jeder Pixel ist entweder 0 oder 255.
+ * Ausgabe ist echtes bilevel: jeder Pixel ist entweder Tinte oder Papier.
+ * Die vorige Version war zu permissiv: ein separates "Faint-ink"-ODER konnte
+ * Schatten/Papierstruktur als Tinte retten. Jetzt entscheidet ein EINZIGER
+ * lokaler Schwellwert: Sauvola (lokale Statistik) wird durch die lokale
+ * Papierweiss-Schätzung gedeckelt. Damit kann Hintergrund nie bloss wegen
+ * Beleuchtungsabfall schwarz werden, aber echte dunkle Notentinte bleibt scharf.
  */
-export function binarizeMusicDocument(canvas: HTMLCanvasElement): HTMLCanvasElement {
+export function binarizeMusicDocument(canvas: HTMLCanvasElement, preset: BinarizePreset = 'balanced'): HTMLCanvasElement {
+  const profile = BINARIZE_PROFILES[preset];
   const w = canvas.width, h = canvas.height;
   const ctx = canvas.getContext('2d')!;
   const img = ctx.getImageData(0, 0, w, h);
@@ -595,8 +617,9 @@ export function binarizeMusicDocument(canvas: HTMLCanvasElement): HTMLCanvasElem
     lum[p] = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
   }
 
-  // Lokales Fenster: gross genug für Papier-/Schattenverlauf, klein genug für
-  // lokale Kontrastwechsel innerhalb einer Notenseite. Alles proportional.
+  // Fenster proportional: bei 300dpi-A4 typ. 85-125px. Das sieht lokal genug
+  // für Schatten aus, aber weit genug, um Buchstaben/Notenköpfe nicht als
+  // Hintergrund zu interpretieren.
   const win = makeOdd(clampNum(Math.min(w, h) * 0.035, 51, 181));
   const r = Math.floor(win / 2);
   const stride = w + 1;
@@ -618,10 +641,8 @@ export function binarizeMusicDocument(canvas: HTMLCanvasElement): HTMLCanvasElem
     }
   }
 
-  // Zweite lokale Spur: geschätztes Papierweiss aus hohen Perzentilen.
   const bgmap = computeBgMap(canvas, 0.035);
   const bin = new Uint8Array(n);
-  const sauvolaK = 0.28;
   const sauvolaR = 128;
 
   for (let y = 0; y < h; y++) {
@@ -638,25 +659,20 @@ export function binarizeMusicDocument(canvas: HTMLCanvasElement): HTMLCanvasElem
       const mean = sum / area;
       const variance = Math.max(0, sumSq / area - mean * mean);
       const std = Math.sqrt(variance);
-      const sauvola = mean * (1 + sauvolaK * (std / sauvolaR - 1));
+      const sauvola = mean * (1 + profile.sauvolaK * (std / sauvolaR - 1));
 
       const idx = y * w + x;
       const l = lum[idx];
       const bg = bgmap.at(x, y);
-      // Faint-ink-Rettung: Wenn ein Pixel gegenüber seinem lokalen Papierweiss
-      // deutlich dunkler ist, zählt er als Tinte, auch wenn Sauvola wegen sehr
-      // niedrigen Kontrasts zu streng wäre. Die Mindestdifferenz skaliert mit
-      // dem lokalen Papierwert und ist nach oben/unten begrenzt.
-      const drop = clampNum(bg * 0.085, 14, 32);
-      const contrastInk = (bg - l) >= drop && l <= bg * 0.93;
-      const sauvolaInk = l <= sauvola + 2;
-      bin[idx] = (sauvolaInk || contrastInk) ? 1 : 0;
+      const requiredDrop = clampNum(bg * profile.dropFrac, profile.minDrop, profile.maxDrop);
+      // Der lokale Sauvola-Wert darf nie über "Papierweiss minus Mindestabstand"
+      // steigen. Genau das verhindert den unbrauchbaren Grauschleier->Tinte-Fall.
+      const threshold = clampNum(Math.min(sauvola + profile.bias, bg - requiredDrop), 0, 245);
+      bin[idx] = l <= threshold ? 1 : 0;
     }
   }
 
-  // Minimal-invasive Nacharbeit: Lücken in dünnen Notenlinien heilen und nur
-  // einzelne Sensor-/JPEG-Pixel entfernen. Keine Erosion/Dilation im grossen Stil.
-  const bridged = bridgeHorizontalMicroGaps(bin, w, h, Math.max(1, Math.round(Math.min(w, h) * 0.0007)));
+  const bridged = bridgeHorizontalMicroGaps(bin, w, h, Math.max(1, Math.round(Math.min(w, h) * profile.bridgeFactor)));
   const cleaned = conservativeClean(bridged, w, h);
   return drawBilevelCanvas(cleaned, w, h);
 }
@@ -748,8 +764,20 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
   halves.forEach((hc, idx) => {
     const norm = normalizeIllumination(hc);
     if (idx === 0) debug.stageImages.push({ label: 'Schatten entfernt', dataUrl: downscale(norm, 700).toDataURL('image/jpeg', 0.75) });
-    const bw = binarizeMusicDocument(norm);
-    if (idx === 0) debug.stageImages.push({ label: 'Schwarz-Weiß (lokal adaptiv, echte 0/255-Pixel)', dataUrl: downscale(bw, 700, false).toDataURL('image/png') });
+
+    // Diagnose: drei lokale SW-Kandidaten auf verkleinerter Kopie. So können
+    // Mensch und Agent sofort sehen, ob das Problem "zu viel Dreck" oder
+    // "zu wenig Tinte" ist, ohne dreimal die volle Seite zu rechnen.
+    if (idx === 0) {
+      const prev = downscale(norm, 1200);
+      for (const preset of ['strict', 'balanced', 'sensitive'] as const) {
+        const cand = binarizeMusicDocument(prev, preset);
+        debug.stageImages.push({ label: `SW-Kandidat ${preset}`, dataUrl: cand.toDataURL('image/png') });
+      }
+    }
+
+    const bw = binarizeMusicDocument(norm, 'balanced');
+    if (idx === 0) debug.stageImages.push({ label: 'Schwarz-Weiß AUSGABE (balanced, echte 0/255-Pixel)', dataUrl: downscale(bw, 700, false).toDataURL('image/png') });
     results.push({ canvas: bw, debug });
   });
   return results;

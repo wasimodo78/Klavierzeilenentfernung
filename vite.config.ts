@@ -2,7 +2,7 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import {defineConfig, type Plugin} from 'vite';
-import {writeFileSync, mkdirSync} from 'node:fs';
+import {writeFileSync, mkdirSync, appendFileSync} from 'node:fs';
 
 // Dev-Server-Ablage für den Direkt-Download: die App POSTet das generierte
 // PDF hierher; ein GET liefert es mit Attachment-Header aus (neuer Tab
@@ -27,6 +27,30 @@ const exportStorePlugin = (): Plugin => ({
         res.statusCode = 200;
         res.setHeader('Content-Type', 'application/json');
         res.end(JSON.stringify({ ok: true, saved: `${dir}/${name}` }));
+      });
+    });
+
+    // Diagnosepakete aus App 2 direkt im Repository sichern. Dadurch kann der
+    // Agent die Resultate lokal öffnen, bewerten, iterieren und bei Bedarf den
+    // Ordner nach GitHub pushen. Nur Dev-Server; im statischen Build ignoriert.
+    server.middlewares.use('/api/scan-capture', (req, res) => {
+      if (req.method !== 'POST') { res.statusCode = 405; res.end(); return; }
+      const url = new URL(req.url ?? '', 'http://localhost');
+      const safe = (v: string) => v.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 140);
+      const session = safe(url.searchParams.get('session') ?? new Date().toISOString().replace(/[:.]/g, '-'));
+      const name = safe(url.searchParams.get('name') ?? 'artifact.bin');
+      const dir = path.resolve(__dirname, 'debug_scan', session);
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        mkdirSync(dir, { recursive: true });
+        const data = Buffer.concat(chunks);
+        const filePath = path.join(dir, name);
+        writeFileSync(filePath, data);
+        appendFileSync(path.join(dir, 'manifest.txt'), `${new Date().toISOString()}  ${name}  ${data.length} bytes\n`);
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ ok: true, saved: path.relative(__dirname, filePath), dir: path.relative(__dirname, dir), bytes: data.length }));
       });
     });
 
