@@ -474,6 +474,37 @@ export function downscale(src: HTMLCanvasElement, maxDim: number): HTMLCanvasEle
 }
 
 // --- Orchestrierte Normalisierung (Stufe 1) ---------------------------------
+
+// Stufe 1: Kontrastverbesserung. Globales Luminanz-Stretching:
+// Percentile 2%..98% --> 0..255; Schatten bleiben bleich, Tinte wird dunkler.
+export function boostContrast(canvas: HTMLCanvasElement, pLow = 0.02, pHigh = 0.98): HTMLCanvasElement {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d')!;
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const hist = new Float64Array(256);
+  for (let i = 0; i < d.length; i += 4) hist[Math.floor(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2])]++;
+  const total = w * h;
+  const percentile = (frac: number): number => {
+    let acc = 0;
+    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= total * frac) return v; }
+    return 255;
+  };
+  const low = percentile(pLow), high = percentile(pHigh);
+  const scale = high > low ? 255 / (high - low) : 1;
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const octx = out.getContext('2d')!;
+  const oimg = octx.createImageData(w, h);
+  const od = oimg.data;
+  for (let i = 0; i < d.length; i += 4) {
+    for (let c = 0; c < 3; c++) od[i + c] = Math.min(255, Math.max(0, (d[i + c] - low) * scale));
+    od[i + 3] = 255;
+  }
+  octx.putImageData(oimg, 0, 0);
+  return out;
+}
+
 export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<RestoredPage[]> {
   const debug: ScanDebug = {
     orientationVotes: '', fineAngleDeg: 0, split: 'einseitig', splitColumnX: null, splitEvidence: '', stageImages: []
@@ -484,7 +515,14 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
   // 1. Groborientierung (inkl. 90°!)
   const o = estimateOrientation90(srcCanvas);
   debug.orientationVotes = o.votes;
-  let work = srcCanvas;
+  // Stufe 1: Kontrastverbesserung (globales Luminanz-Stretching) + Stufe 2:
+  // Vereinheitlichung (Schatten entfernen) - erst Helligkeit und Einheitlichkeit
+  // sicherstellen, dann MESSEN und KORRIGIEREN, in dieser Reihenfolge.
+  let work = boostContrast(srcCanvas);
+  debug.stageImages.push({ label: 'Kontrastverbesserung', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
+  work = normalizeIllumination(work);
+  debug.stageImages.push({ label: 'Vereinheitlichung', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
+
   if (o.rotate90) {
     const r = document.createElement('canvas');
     r.width = srcCanvas.height; r.height = srcCanvas.width;
@@ -901,12 +939,22 @@ export function estimateTrackGrid(canvas: HTMLCanvasElement): GridResult {
       lastY = rowsMidY[j];
     }
     if (seq.length === 5) {
+      // Fragmente muessen sich nicht ueberschneiden: Entscheidend ist die
+      // vereinigte x-Deckung (Union der x-Intervalle >= 25% der Breite).
       const five = seq.map(g => rowsBest[g]);
-      let okOverlap = true;
-      for (let a = 0; a < 4; a++) {
-        if (overlapWidth(five[a], five[a + 1]) < w * 0.25) { okOverlap = false; break; }
+      const intervals = five.map(t => [t.startX, t.endX] as [number, number]).sort((a, b) => a[0] - b[0]);
+      let cover = 0; let cur0 = -1e9, cur1 = -1e9;
+      for (const [a2, b2] of intervals) {
+        if (a2 > cur1) { cover += cur1 - cur0; cur0 = a2; cur1 = b2; } else if (b2 > cur1) cur1 = b2;
       }
-      if (okOverlap) {
+      cover += cur1 - cur0;
+      // Zentaum der Fuenf-Trajektorien: Fragmente derselben Notenlinie haften
+      // im Mittel die gleiche x-Position. Mischen wir Spuren von Nachbarsystemen,
+      // variiert ihr Zentrum ueber den halben Bereich streuend.
+      const centers = five.map(t => (t.startX + t.endX) / 2);
+      const cMin = Math.min(...centers), cMax = Math.max(...centers);
+      const cSpreadOK = (cMax - cMin) <= w * 0.4;
+      if (cover >= w * 0.25 && cSpreadOK) {
         seq.forEach(g => usedRow.add(g));
         staves.push({ rows: five });
         i2 = seq[seq.length - 1];
