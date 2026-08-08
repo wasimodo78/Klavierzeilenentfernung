@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="de">
+<head><meta charset="utf-8"><title>Testdatei senden</title>
+<style>
+  body { font-family: system-ui, sans-serif; background:#f8fafc; display:flex; min-height:100vh; align-items:center; justify-content:center; margin:0; }
+  .card { background:white; border:1px solid #e2e8f0; border-radius:14px; padding:32px; max-width:520px; width:100%; box-shadow:0 8px 24px rgba(0,0,0,.08); }
+  h1 { font-size:20px; margin:0 0 8px; color:#1e293b; }
+  p { color:#64748b; font-size:14px; }
+  button { margin-top:16px; background:#4f46e5; color:white; border:0; border-radius:8px; padding:10px 20px; font-size:15px; cursor:pointer; }
+  button:disabled { background:#94a3b8; }
+  #status { margin-top:16px; font-size:14px; }
+  .ok { color:#059669; } .err { color:#dc2626; }
+</style></head>
+<body>
+  <div class="card">
+    <h1>Testdatei an die Entwicklungsumgebung senden</h1>
+    <p>Nur für Debugging: Die Datei landet als Datei in der Sandbox (nicht in der App verarbeitet).</p>
+    <input type="file" id="f" accept="application/pdf">
+    <button id="b" disabled>Senden</button>
+    <div id="status"></div>
+  </div>
+<script>
+  const f = document.getElementById('f'), b = document.getElementById('b'), s = document.getElementById('status');
+  f.onchange = () => { b.disabled = !f.files.length; };
+  b.onclick = async () => {
+    if (!f.files.length) return;
+    b.disabled = true; s.className=''; s.textContent = 'Sende…';
+    const file = f.files[0];
+    try {
+      const r = await fetch('/api/upload?name=' + encodeURIComponent(file.name), { method: 'POST', body: file });
+      const j = await r.json();
+      if (j.ok) { s.className='ok'; s.textContent = '✔ Gespeichert als ' + j.saved; }
+      else { s.className='err'; s.textContent = 'Fehler: ' + JSON.stringify(j); }
+    } catch (e) { s.className='err'; s.textContent = 'Fehler: ' + e; }
+    b.disabled = false;
+  };
+</script>
+</body></html>
