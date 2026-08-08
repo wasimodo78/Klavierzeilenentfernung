@@ -8,6 +8,8 @@ const CONTENT_WIDTH_MM = PAGE_LAYOUT.A4_WIDTH_MM - 2 * PAGE_LAYOUT.MARGIN_MM;
 const IS_FRAMED = typeof window !== 'undefined' && window.self !== window.top;
 import { analyzePdfVectors } from './utils/vectorAnalyzer';
 import { analyzePixels } from './utils/cvAnalyzer';
+import { restoreScanImage, downscale, RestoredPage, ScanDebug } from './utils/scanRestorer';
+import { jsPDF } from 'jspdf';
 import * as pdfjsLib from 'pdfjs-dist';
 
 export default function App() {
@@ -28,6 +30,9 @@ export default function App() {
   
   const [currentFile, setCurrentFile] = useState<File | null>(null);
   const [viewMode, setViewMode] = useState<'systems' | 'pages'>('pages');
+  const [scanMode, setScanMode] = useState<'zuschneiden' | 'restaurieren'>('zuschneiden');
+  const [restored, setRestored] = useState<RestoredPage[] | null>(null);
+  const [restoreDebug, setRestoreDebug] = useState<ScanDebug[] | null>(null);
 
   const previewPages = useMemo(() => {
     if (!previewImages) return [];
@@ -354,6 +359,116 @@ export default function App() {
     }
   };
 
+  const handleScanInput = async (files: File[]) => {
+    setRestored(null);
+    setRestoreDebug(null);
+    setCurrentFile(files[0] ?? null);
+    setIsProcessing(true);
+    setProgressMsg('Restauriere Scan(s)...');
+    setProgressPct(0);
+
+    try {
+      const outRestored: RestoredPage[] = [];
+      const outDebug: ScanDebug[] = [];
+      let inputCount = 0;
+
+      const processCanvas = async (canvas: HTMLCanvasElement, label: string, base: number, total: number) => {
+        setProgressMsg(`${label}: Vermesse & entzerre...`);
+        const pages = await restoreScanImage(canvas);
+        outRestored.push(...pages);
+        pages.forEach(() => outDebug.push(pages[0].debug));
+      };
+
+      for (let k = 0; k < files.length; k++) {
+        const f = files[k];
+        const label = `Quelle ${k + 1}/${files.length} (${f.name})`;
+        setProgressPct(10 + (k / files.length) * 80);
+        if (f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')) {
+          const arrayBuffer = await f.arrayBuffer();
+          const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+          for (let i = 1; i <= pdf.numPages; i++) {
+            setProgressMsg(`${label}: Seite ${i} von ${pdf.numPages}...`);
+            const page = await pdf.getPage(i);
+            const uv = page.getViewport({ scale: 1.0 });
+            const scale = 2480 / uv.width;
+            const viewport = page.getViewport({ scale });
+            const canvas = document.createElement('canvas');
+            canvas.width = viewport.width; canvas.height = viewport.height;
+            await page.render({ canvasContext: canvas.getContext('2d')!, viewport }).promise;
+            await processCanvas(canvas, label + ` Seite ${i}`, 0, files.length);
+            page.cleanup();
+            canvas.width = 0; canvas.height = 0;
+          }
+        } else {
+          const bmp = await createImageBitmap(f, { imageOrientation: 'from-image' } as ImageBitmapOptions);
+          const canvas = document.createElement('canvas');
+          canvas.width = bmp.width; canvas.height = bmp.height;
+          canvas.getContext('2d')!.drawImage(bmp, 0, 0);
+          bmp.close();
+          await processCanvas(canvas, label, 0, files.length);
+        }
+        setMainDebug([]);
+      }
+
+      setProgressMsg('Restauriert!');
+      setProgressPct(100);
+      setRestored(outRestored);
+      setRestoreDebug(outDebug);
+    } catch (err) {
+      console.error(err);
+      alert('Fehler beim Restaurieren des Scans.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleRestoredDownload = async () => {
+    if (!restored || restored.length === 0 || !currentFile) return;
+    setIsProcessing(true);
+    setProgressMsg('Erstelle PDF...');
+    setProgressPct(40);
+    try {
+      const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+      const margin = PAGE_LAYOUT.MARGIN_MM;
+      const pageW = PAGE_LAYOUT.A4_WIDTH_MM;
+      const pageH = PAGE_LAYOUT.A4_HEIGHT_MM;
+      const contentW = pageW - 2 * margin;
+      const contentH = pageH - 2 * margin;
+
+      const loadCanvasAsImg = (c: HTMLCanvasElement) => c;
+
+      for (let p = 0; p < restored.length; p++) {
+        if (p > 0) pdf.addPage();
+        const c = restored[p].canvas;
+        const dataUrl = c.toDataURL('image/jpeg', 0.92);
+        // Seite einmessen in Inhaltsbereich (zentriert)
+        const scale = Math.min(contentW / (c.width / 3.78), contentH / (c.height / 3.78)); // grob
+        const wMm = (c.width / 3.78) * scale;
+        const hMm = (c.height / 3.78) * scale;
+        const xMm = margin + (contentW - wMm) / 2;
+        const yMm = margin + (contentH - hMm) / 2;
+        pdf.addImage(dataUrl, 'JPEG', xMm, yMm, wMm, hMm);
+      }
+
+      const blob = pdf.output('blob');
+      const name = currentFile.name.replace(/\.(pdf|jpe?g|png)$/i, '') + '_restauriert.pdf';
+      const url = URL.createObjectURL(blob);
+      setDownload(prev => { if (prev) URL.revokeObjectURL(prev.url); return { url, name }; });
+      const aa = document.createElement('a');
+      aa.href = url; aa.download = name;
+      document.body.appendChild(aa); aa.click(); document.body.removeChild(aa);
+      try {
+        const resp = await fetch(`/api/export?name=${encodeURIComponent(name)}`, { method: 'POST', body: blob });
+        if (resp.ok) setServerUrl(`/api/export.pdf?t=${Date.now()}`);
+      } catch { /* statisches Hosting ok */ }
+    } catch (err) {
+      console.error(err);
+      alert('Fehler beim Erstellen des PDFs.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col items-center py-10 px-4 font-sans text-slate-900">
       <div className="w-full max-w-4xl bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-100">
@@ -392,8 +507,45 @@ export default function App() {
         {/* Main Content */}
         <div className="p-8">
           
-          {!isProcessing && !previewImages && debugOutputs.length === 0 && cvDebugImages.length === 0 && cvCroppedImages.length === 0 && (
+          {!isProcessing && !previewImages && !restored && debugOutputs.length === 0 && cvDebugImages.length === 0 && cvCroppedImages.length === 0 && (
             <div className="space-y-6 max-w-2xl mx-auto">
+              {/* Modus-Schalter: App 1 (Zuschneiden) <=> App 2 (Scan-Restauration) */}
+              <div className="flex bg-slate-100 p-1.5 rounded-xl">
+                <button
+                  onClick={() => setScanMode('zuschneiden')}
+                  className={`flex-1 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors ${scanMode === 'zuschneiden' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  PDF zuschneiden
+                </button>
+                <button
+                  onClick={() => setScanMode('restaurieren')}
+                  className={`flex-1 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors ${scanMode === 'restaurieren' ? 'bg-white text-emerald-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                >
+                  Scan restaurieren
+                </button>
+              </div>
+
+            {scanMode === 'restaurieren' ? (
+              <div
+                onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+                onDragLeave={() => setIsDragOver(false)}
+                onDrop={(e) => { e.preventDefault(); setIsDragOver(false); if (e.dataTransfer.files && e.dataTransfer.files.length > 0) handleScanInput(Array.from(e.dataTransfer.files) as File[]); }}
+                className={`relative border-2 border-dashed rounded-xl p-16 text-center transition-colors cursor-pointer w-full
+                  ${isDragOver ? 'border-emerald-500 bg-emerald-50' : 'border-emerald-300 hover:border-emerald-400 hover:bg-emerald-50/50'}
+                `}
+              >
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png,application/pdf"
+                  multiple
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                  onChange={(e) => { if (e.target.files && e.target.files.length > 0) { const files = Array.from(e.target.files) as File[]; e.target.value = ''; handleScanInput(files); } }}
+                />
+                <UploadCloud className="w-16 h-16 text-emerald-400 mx-auto mb-4" />
+                <h3 className="text-xl font-semibold text-slate-700 mb-2">Scan restaurieren</h3>
+                <p className="text-slate-500">Handyfoto(s) oder Scan-PDF hier ablegen oder klicken (mehrere Dateien erlaubt)</p>
+              </div>
+            ) : (
               <div
                 onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
                 onDragLeave={() => setIsDragOver(false)}
@@ -412,7 +564,9 @@ export default function App() {
                 <h3 className="text-xl font-semibold text-slate-700 mb-2">PDF zuschneiden</h3>
                 <p className="text-slate-500">Klavierzeilen entfernen &amp; Chor neu anordnen — PDF hier ablegen oder klicken</p>
               </div>
+            )}
 
+              {scanMode === 'zuschneiden' && (
               <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 bg-slate-50 border border-slate-200 rounded-xl px-4 py-3">
                 <label htmlFor="output-quality" className="text-sm font-medium text-slate-700">Ausgabequalität:</label>
                 <select
@@ -426,6 +580,7 @@ export default function App() {
                   <option value="foto300">Foto/Farbe JPEG 300 dpi (für Graustufen-Scans)</option>
                 </select>
               </div>
+              )}
 
               <div className="grid grid-cols-2 gap-4">
                 <div className="relative border-2 border-dashed rounded-xl p-8 text-center transition-colors cursor-pointer w-full border-amber-300 hover:border-amber-500 hover:bg-amber-50">
@@ -516,7 +671,73 @@ export default function App() {
             </div>
           )}
 
+          {restored && !isProcessing && (
+            <div className="animate-in fade-in zoom-in-95 duration-300 mb-12">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 pb-4 border-b border-slate-100 gap-4">
+                <div className="flex items-center gap-2 text-slate-800">
+                  <Eye className="w-5 h-5 text-emerald-600" />
+                  <h3 className="text-xl font-semibold">Restaurierte Seiten ({restored.length})</h3>
+                </div>
+                <button
+                  onClick={handleRestoredDownload}
+                  className="inline-flex items-center gap-2 px-6 py-2 bg-emerald-600 text-white rounded-lg font-medium hover:bg-emerald-700 transition-colors shadow-sm"
+                >
+                  <Download className="w-4 h-4" />
+                  PDF Exportieren (restauriert)
+                </button>
+              </div>
+
+              <div className="space-y-10">
+                {restored.map((p, idx) => (
+                  <div key={idx} className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-sm">
+                    <div className="bg-emerald-50 border-b border-emerald-100 px-4 py-2 flex items-center justify-between">
+                      <p className="text-sm font-medium text-emerald-800">Seite {idx + 1} — restauriert</p>
+                    </div>
+                    <div className="p-4 flex flex-col md:flex-row gap-4 items-start">
+                      <img src={downscale(p.canvas, 900).toDataURL('image/jpeg', 0.85)} alt={`Restauriert Seite ${idx + 1}`} className="w-full md:w-2/3 object-contain border border-slate-100 rounded" />
+
+                      {/* Debugging-Belege (Messen, Stufen, Werte) */}
+                      <div className="w-full md:w-1/3 space-y-3">
+                        <details className="bg-slate-50 border border-slate-200 rounded-lg overflow-hidden" open>
+                          <summary className="cursor-pointer px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 select-none">
+                            Messwerte & Stufen (Debug)
+                          </summary>
+                          <div className="p-3 space-y-3 text-xs text-slate-700">
+                            <div>
+                              <p className="font-semibold mb-1">Orientierung</p>
+                              <p>Votes: {restoreDebug && restoreDebug[idx] ? restoreDebug[idx].orientationVotes : '-'}</p>
+                              <p>Feinwinkel: {restoreDebug && restoreDebug[idx] ? restoreDebug[idx].fineAngleDeg.toFixed(2) + '°' : '-'}</p>
+                            </div>
+                            <div>
+                              <p className="font-semibold mb-1">Doppelseiten</p>
+                              <p>{restoreDebug && restoreDebug[idx] ? restoreDebug[idx].split : '-'} · {restoreDebug && restoreDebug[idx] ? restoreDebug[idx].splitEvidence : ''}</p>
+                              <p>bei x = {restoreDebug && restoreDebug[idx] && restoreDebug[idx].splitColumnX !== null ? restoreDebug[idx].splitColumnX : '–'}</p>
+                            </div>
+                          </div>
+                        </details>
+                        {restoreDebug && restoreDebug[idx] && restoreDebug[idx].stageImages && (
+                          <div className="bg-white border border-slate-100 rounded-lg overflow-hidden">
+                            <div className="px-3 py-2 text-xs font-semibold text-slate-500 border-b border-slate-100">Stufen (Vorher/Nachher)</div>
+                            <div className="grid grid-cols-2 gap-1 p-2">
+                              {restoreDebug[idx].stageImages.map((s, j) => (
+                                <figure key={j} className="border border-slate-100 rounded overflow-hidden">
+                                  <img src={s.dataUrl} alt={s.label} className="w-full object-contain bg-white" />
+                                  <figcaption className="px-2 py-1 text-[11px] text-slate-500 bg-slate-50 truncate" title={s.label}>{s.label}</figcaption>
+                                </figure>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {previewImages && !isProcessing && (
+
             <div className="animate-in fade-in zoom-in-95 duration-300">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-6 pb-4 border-b border-slate-100 gap-4">
                 <div className="flex items-center gap-2 text-slate-800">
