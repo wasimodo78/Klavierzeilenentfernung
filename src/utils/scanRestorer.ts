@@ -459,17 +459,21 @@ export function normalizeIllumination(canvas: HTMLCanvasElement, tileFrac = 0.04
 }
 
 // --- Hilfen ------------------------------------------------------------------
-export function downscale(src: HTMLCanvasElement, maxDim: number): HTMLCanvasElement {
+export function downscale(src: HTMLCanvasElement, maxDim: number, smoothing = true): HTMLCanvasElement {
   const f = Math.min(1, maxDim / Math.max(src.width, src.height));
   if (f >= 1) {
     const c = document.createElement('canvas');
     c.width = src.width; c.height = src.height;
-    c.getContext('2d')!.drawImage(src, 0, 0);
+    const ctx = c.getContext('2d')!;
+    ctx.imageSmoothingEnabled = smoothing;
+    ctx.drawImage(src, 0, 0);
     return c;
   }
   const c = document.createElement('canvas');
   c.width = Math.round(src.width * f); c.height = Math.round(src.height * f);
-  c.getContext('2d')!.drawImage(src, 0, 0, c.width, c.height);
+  const ctx = c.getContext('2d')!;
+  ctx.imageSmoothingEnabled = smoothing;
+  ctx.drawImage(src, 0, 0, c.width, c.height);
   return c;
 }
 
@@ -505,6 +509,158 @@ export function boostContrast(canvas: HTMLCanvasElement, pLow = 0.02, pHigh = 0.
   return out;
 }
 
+
+function clampNum(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function makeOdd(n: number): number {
+  const i = Math.max(3, Math.round(n));
+  return i % 2 === 0 ? i + 1 : i;
+}
+
+function drawBilevelCanvas(bin: Uint8Array, w: number, h: number): HTMLCanvasElement {
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const ctx = out.getContext('2d')!;
+  const img = ctx.createImageData(w, h);
+  const d = img.data;
+  for (let i = 0; i < bin.length; i++) {
+    const v = bin[i] ? 0 : 255;
+    const j = i * 4;
+    d[j] = v; d[j + 1] = v; d[j + 2] = v; d[j + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return out;
+}
+
+function bridgeHorizontalMicroGaps(bin: Uint8Array, w: number, h: number, maxGap: number): Uint8Array {
+  const out = bin.slice();
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let x = 1;
+    while (x < w - 1) {
+      if (bin[row + x]) { x++; continue; }
+      const start = x;
+      while (x < w - 1 && !bin[row + x]) x++;
+      const end = x; // first black or w-1
+      const len = end - start;
+      if (len > 0 && len <= maxGap && bin[row + start - 1] && end < w && bin[row + end]) {
+        for (let xx = start; xx < end; xx++) out[row + xx] = 1;
+      }
+    }
+  }
+  return out;
+}
+
+function conservativeClean(bin: Uint8Array, w: number, h: number): Uint8Array {
+  const out = bin.slice();
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      let n = 0;
+      n += bin[i - w - 1]; n += bin[i - w]; n += bin[i - w + 1];
+      n += bin[i - 1];                         n += bin[i + 1];
+      n += bin[i + w - 1]; n += bin[i + w]; n += bin[i + w + 1];
+      if (bin[i]) {
+        // Nur echte Einzelpixel entfernen. Kleine musikalische Zeichen (Punkte,
+        // Akzente, Fingersätze) haben fast immer mindestens zwei Nachbarn.
+        if (n <= 1) out[i] = 0;
+      } else {
+        // Winzige weisse Löcher in Buchstaben/Notenköpfen schliessen.
+        if (n >= 7) out[i] = 1;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Finale Schwarz-Weiss-Separation für Musikscans.
+ *
+ * Das ist bewusst NICHT ein globaler Schwellenwert: Pro Pixel wird eine lokale
+ * Sauvola-Schwelle (Mittelwert/Standardabweichung im Fenster) mit einer lokalen
+ * Papierweiss-Schätzung kombiniert. Dadurch bleiben dünne Notenlinien in
+ * Schattenbereichen erhalten, während Beleuchtungsverläufe weiss bleiben.
+ * Ausgabe ist echtes bilevel: jeder Pixel ist entweder 0 oder 255.
+ */
+export function binarizeMusicDocument(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d')!;
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const n = w * h;
+  const lum = new Uint8Array(n);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    lum[p] = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+  }
+
+  // Lokales Fenster: gross genug für Papier-/Schattenverlauf, klein genug für
+  // lokale Kontrastwechsel innerhalb einer Notenseite. Alles proportional.
+  const win = makeOdd(clampNum(Math.min(w, h) * 0.035, 51, 181));
+  const r = Math.floor(win / 2);
+  const stride = w + 1;
+  const integral = new Float64Array((w + 1) * (h + 1));
+  const integralSq = new Float64Array((w + 1) * (h + 1));
+
+  for (let y = 0; y < h; y++) {
+    let rowSum = 0;
+    let rowSq = 0;
+    const srcRow = y * w;
+    const dstRow = (y + 1) * stride;
+    const prevRow = y * stride;
+    for (let x = 0; x < w; x++) {
+      const v = lum[srcRow + x];
+      rowSum += v;
+      rowSq += v * v;
+      integral[dstRow + x + 1] = integral[prevRow + x + 1] + rowSum;
+      integralSq[dstRow + x + 1] = integralSq[prevRow + x + 1] + rowSq;
+    }
+  }
+
+  // Zweite lokale Spur: geschätztes Papierweiss aus hohen Perzentilen.
+  const bgmap = computeBgMap(canvas, 0.035);
+  const bin = new Uint8Array(n);
+  const sauvolaK = 0.28;
+  const sauvolaR = 128;
+
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r);
+    const y1 = Math.min(h - 1, y + r);
+    const iy0 = y0 * stride;
+    const iy1 = (y1 + 1) * stride;
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r);
+      const x1 = Math.min(w - 1, x + r);
+      const area = (x1 - x0 + 1) * (y1 - y0 + 1);
+      const sum = integral[iy1 + x1 + 1] - integral[iy1 + x0] - integral[iy0 + x1 + 1] + integral[iy0 + x0];
+      const sumSq = integralSq[iy1 + x1 + 1] - integralSq[iy1 + x0] - integralSq[iy0 + x1 + 1] + integralSq[iy0 + x0];
+      const mean = sum / area;
+      const variance = Math.max(0, sumSq / area - mean * mean);
+      const std = Math.sqrt(variance);
+      const sauvola = mean * (1 + sauvolaK * (std / sauvolaR - 1));
+
+      const idx = y * w + x;
+      const l = lum[idx];
+      const bg = bgmap.at(x, y);
+      // Faint-ink-Rettung: Wenn ein Pixel gegenüber seinem lokalen Papierweiss
+      // deutlich dunkler ist, zählt er als Tinte, auch wenn Sauvola wegen sehr
+      // niedrigen Kontrasts zu streng wäre. Die Mindestdifferenz skaliert mit
+      // dem lokalen Papierwert und ist nach oben/unten begrenzt.
+      const drop = clampNum(bg * 0.085, 14, 32);
+      const contrastInk = (bg - l) >= drop && l <= bg * 0.93;
+      const sauvolaInk = l <= sauvola + 2;
+      bin[idx] = (sauvolaInk || contrastInk) ? 1 : 0;
+    }
+  }
+
+  // Minimal-invasive Nacharbeit: Lücken in dünnen Notenlinien heilen und nur
+  // einzelne Sensor-/JPEG-Pixel entfernen. Keine Erosion/Dilation im grossen Stil.
+  const bridged = bridgeHorizontalMicroGaps(bin, w, h, Math.max(1, Math.round(Math.min(w, h) * 0.0007)));
+  const cleaned = conservativeClean(bridged, w, h);
+  return drawBilevelCanvas(cleaned, w, h);
+}
+
 export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<RestoredPage[]> {
   const debug: ScanDebug = {
     orientationVotes: '', fineAngleDeg: 0, split: 'einseitig', splitColumnX: null, splitEvidence: '', stageImages: []
@@ -525,11 +681,13 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
 
   if (o.rotate90) {
     const r = document.createElement('canvas');
-    r.width = srcCanvas.height; r.height = srcCanvas.width;
+    r.width = work.height; r.height = work.width;
     const rctx = r.getContext('2d')!;
+    rctx.fillStyle = 'white';
+    rctx.fillRect(0, 0, r.width, r.height);
     rctx.translate(r.width / 2, r.height / 2);
     rctx.rotate(Math.PI / 2);
-    rctx.drawImage(srcCanvas, -srcCanvas.width / 2, -srcCanvas.height / 2);
+    rctx.drawImage(work, -work.width / 2, -work.height / 2);
     work = r;
   }
 
@@ -582,12 +740,17 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
     halves.push(work);
   }
 
-  // 5. Illuminations-Normalisierung je Halbseite
+  // 5. Illuminations-Normalisierung je Halbseite + finale lokale
+  // Schwarz-Weiss-Separation. Binarisierung kommt bewusst NACH allen
+  // geometrischen Resamplings: So entstehen keine grauen Rotations-/Warp-Kanten
+  // im Endergebnis. Das PDF bekommt danach echte 0/255-Pixel als PNG.
   const results: RestoredPage[] = [];
   halves.forEach((hc, idx) => {
     const norm = normalizeIllumination(hc);
     if (idx === 0) debug.stageImages.push({ label: 'Schatten entfernt', dataUrl: downscale(norm, 700).toDataURL('image/jpeg', 0.75) });
-    results.push({ canvas: norm, debug });
+    const bw = binarizeMusicDocument(norm);
+    if (idx === 0) debug.stageImages.push({ label: 'Schwarz-Weiß (lokal adaptiv, echte 0/255-Pixel)', dataUrl: downscale(bw, 700, false).toDataURL('image/png') });
+    results.push({ canvas: bw, debug });
   });
   return results;
 }

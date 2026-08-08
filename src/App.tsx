@@ -373,7 +373,7 @@ export default function App() {
       let inputCount = 0;
 
       const processCanvas = async (canvas: HTMLCanvasElement, label: string, base: number, total: number) => {
-        setProgressMsg(`${label}: Vermesse & entzerre...`);
+        setProgressMsg(`${label}: Vermesse, entzerre & separiere Schwarz-Weiß...`);
         const pages = await restoreScanImage(canvas);
         outRestored.push(...pages);
         pages.forEach(() => outDebug.push(pages[0].debug));
@@ -440,14 +440,16 @@ export default function App() {
       for (let p = 0; p < restored.length; p++) {
         if (p > 0) pdf.addPage();
         const c = restored[p].canvas;
-        const dataUrl = c.toDataURL('image/jpeg', 0.92);
+        // App 2 erzeugt echte Schwarz-Weiss-Seiten. Deshalb PNG statt JPEG:
+        // JPEG würde wieder Graukanten/Artefakte einführen.
+        const dataUrl = c.toDataURL('image/png');
         // Seite einmessen in Inhaltsbereich (zentriert)
         const scale = Math.min(contentW / (c.width / 3.78), contentH / (c.height / 3.78)); // grob
         const wMm = (c.width / 3.78) * scale;
         const hMm = (c.height / 3.78) * scale;
         const xMm = margin + (contentW - wMm) / 2;
         const yMm = margin + (contentH - hMm) / 2;
-        pdf.addImage(dataUrl, 'JPEG', xMm, yMm, wMm, hMm);
+        pdf.addImage(dataUrl, 'PNG', xMm, yMm, wMm, hMm);
       }
 
       const blob = pdf.output('blob');
@@ -694,7 +696,7 @@ export default function App() {
                       <p className="text-sm font-medium text-emerald-800">Seite {idx + 1} — restauriert</p>
                     </div>
                     <div className="p-4 flex flex-col md:flex-row gap-4 items-start">
-                      <img src={downscale(p.canvas, 900).toDataURL('image/jpeg', 0.85)} alt={`Restauriert Seite ${idx + 1}`} className="w-full md:w-2/3 object-contain border border-slate-100 rounded" />
+                      <img src={downscale(p.canvas, 900, false).toDataURL('image/png')} alt={`Restauriert Seite ${idx + 1}`} className="w-full md:w-2/3 object-contain border border-slate-100 rounded" />
 
                       {/* Debugging-Belege (Messen, Stufen, Werte) */}
                       <div className="w-full md:w-1/3 space-y-3">
