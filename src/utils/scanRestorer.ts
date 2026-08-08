@@ -637,7 +637,19 @@ export type Trajectory = {
   fitDeg: number;
   residRms: number;
   evalAt: (x: number) => number;
+  evalAtSafe: (x: number) => number; // ausserhalb: linear aus Messwerten, nicht Polynom
 };
+
+// Lokale Rand-Steigung aus lokalen Messpunkten (kein Polynomableitung - die
+// oszilliert am Rand am staerksten).
+function edgeSlope(pts: TrackPt[], which: 'start' | 'end'): number {
+  const n = Math.min(12, pts.length);
+  if (pts.length < 3) return 0;
+  const pick = which === 'start' ? pts.slice(0, n) : pts.slice(-n);
+  const dx = pick[pick.length - 1].x - pick[0].x;
+  if (Math.abs(dx) < 1e-6) return 0;
+  return (pick[pick.length - 1].y - pick[0].y) / dx;
+}
 
 // Chebyshev-Fit in normalisierter x-Basis; Grad nach vermessener Strecke.
 function chebFit(pts: TrackPt[]): { deg: number; evalAt: (x: number) => number } {
@@ -731,7 +743,19 @@ export function trackOne(d: Uint8ClampedArray, w: number, h: number, seedX: numb
   let sq = 0;
   for (const p of all) sq += (p.y - fit.evalAt(p.x)) ** 2;
   const residRms = Math.sqrt(sq / all.length);
-  return { pts: all, startX: all[0].x, endX: all[all.length - 1].x, fitDeg: fit.deg, residRms, evalAt: fit.evalAt };
+  const evalAtSafe = (x: number) => {
+    if (x < all[0].x) {
+      // links ausser Messinterval: Randsteigung aus den ersten 12 Messpunkten
+      const slope = edgeSlope(all, 'start');
+      return all[0].y + (x - all[0].x) * slope;
+    }
+    if (x > all[all.length - 1].x) {
+      const slope = edgeSlope(all, 'end');
+      return all[all.length - 1].y + (x - all[all.length - 1].x) * slope;
+    }
+    return fit.evalAt(x);
+  };
+  return { pts: all, startX: all[0].x, endX: all[all.length - 1].x, fitDeg: fit.deg, residRms, evalAt: fit.evalAt, evalAtSafe };
 }
 function walkLine(d: Uint8ClampedArray, w: number, h: number, seedX: number, seedY: number, dir: 1 | -1, searchHalf: number, bgAt?: (x: number, y: number) => number): TrackPt[] {
   const pts: TrackPt[] = [];
@@ -749,7 +773,7 @@ function walkLine(d: Uint8ClampedArray, w: number, h: number, seedX: number, see
       voidStreak = 0;
     } else {
       voidStreak++;
-      if (voidStreak > maxVoid) { if (seedX === 108) console.log("  BREAK wegen void x=" + x); break; }
+      if (voidStreak > maxVoid) break;
     }
   }
   return dir === 1 ? pts : pts.reverse();
@@ -932,7 +956,7 @@ export function dewarpByTracks(canvas: HTMLCanvasElement, grid: GridResult): HTM
         .slice()
         .sort((l1, l2) => l1.evalAt(cx) - l2.evalAt(cx))
         .forEach((t, k, arr) => {
-          rowsAsc.push({ yAt: (x: number) => t.evalAt(x) });
+          rowsAsc.push({ yAt: (x: number) => t.evalAtSafe(x) });
         });
     });
   const nRows = rowsAsc.length;
