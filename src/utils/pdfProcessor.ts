@@ -7,7 +7,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
 type Region = { start: number; end: number; type: 'ink' | 'gap' };
 
-export type ExtractedSystem = { dataUrl: string; width: number; height: number; widthMm?: number; heightMm?: number };
+export type ExtractedSystem = { dataUrl: string; width: number; height: number; widthMm?: number; heightMm?: number; newPiece?: boolean };
 
 export type PlacedSystem = { img: ExtractedSystem; wMm: number; hMm: number };
 
@@ -316,6 +316,12 @@ export function groupSystemsIntoPages(images: ExtractedSystem[]): PlacedSystem[]
   for (const img of images) {
     const { wMm, hMm } = layoutSize(img);
 
+    // Neues Stück (Titel mitten im Heft erkannt) -> immer neue Seite beginnen
+    if (img.newPiece && currentY > MARGIN_MM && pages[pages.length - 1].length > 0) {
+      pages.push([]);
+      currentY = MARGIN_MM;
+    }
+
     if (currentY + hMm > A4_HEIGHT_MM - MARGIN_MM && currentY > MARGIN_MM) {
       pages.push([]);
       currentY = MARGIN_MM;
@@ -351,6 +357,13 @@ export async function generatePdf(
     const img = croppedImages[i];
     // Originalgröße platzieren (siehe layoutSize)
     const { wMm, hMm } = layoutSize(img);
+
+    // Neues Stück -> Seitenumbruch erzwingen
+    if (img.newPiece && currentY > margin) {
+      outPdf.addPage();
+      currentY = margin;
+      pageCount++;
+    }
 
     if (currentY + hMm > pageHeight - margin && currentY > margin) {
       outPdf.addPage();

@@ -101,7 +101,7 @@ export default function App() {
           setProgressMsg(`Seite ${i}: ${msg}`);
         }, i, { canvas: outCanvas ?? canvas, bilevel: outputMode !== 'foto300', mmPerPx });
 
-        allStrips.push(...croppedStrips.map(s => ({ dataUrl: s.dataUrl, width: s.width, height: s.height, widthMm: s.widthMm, heightMm: s.heightMm })));
+        allStrips.push(...croppedStrips.map(s => ({ dataUrl: s.dataUrl, width: s.width, height: s.height, widthMm: s.widthMm, heightMm: s.heightMm, newPiece: s.newPiece })));
         allDebug.push({ image: debugImage, stats });
 
         // Raster-Speicher der Seiten-Canvases sofort freigeben (kritisch bei vielen Seiten)

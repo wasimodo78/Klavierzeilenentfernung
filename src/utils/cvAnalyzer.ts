@@ -3,7 +3,7 @@ export async function analyzePixels(
   onProgress: (msg: string) => void,
   pageIndex: number = 1,
   output?: { canvas: HTMLCanvasElement; bilevel: boolean; mmPerPx?: number }
-): Promise<{ debugImage: string, stats: string, croppedStrips: { dataUrl: string, height: number, width: number, widthMm: number, heightMm: number }[] }> {
+): Promise<{ debugImage: string, stats: string, croppedStrips: { dataUrl: string, height: number, width: number, widthMm: number, heightMm: number, newPiece: boolean }[] }> {
   onProgress("Starte Bildanalyse (Binarisierung)...");
   const ctx = canvas.getContext('2d')!;
   // Ausgabe erfolgt optional aus einem separaten hochauflösenden Render
@@ -403,7 +403,7 @@ export async function analyzePixels(
   // Nicht-Klavier-Systemen zusammenhängende Keep-Segmente. Klavier-Läufe
   // (geschweifte Klammer) fallen so auch mitten auf der Seite als Lücke heraus –
   // unabhängig davon, wie die Akkolade-Gruppierung ausgefallen ist.
-  const croppedStrips: { dataUrl: string, height: number, width: number, widthMm: number, heightMm: number }[] = [];
+  const croppedStrips: { dataUrl: string, height: number, width: number, widthMm: number, heightMm: number, newPiece: boolean }[] = [];
   let keepRegionsStats = '';
 
   if (staves.length > 0) {
@@ -444,6 +444,81 @@ export async function analyzePixels(
       return bands;
     };
 
+    // c2) Inhalts-Cluster zwischen zwei Y-Werten (Invertierung der Lücken-Analyse,
+    // z. B. Titel-/Textblöcke zwischen den Systemen)
+    type ContentCluster = { start: number; end: number; size: number; maxLine: number };
+    const findContentClusters = (yFrom: number, yTo: number): ContentCluster[] => {
+      const clusters: ContentCluster[] = [];
+      const from = Math.max(0, Math.floor(yFrom));
+      const to = Math.min(height - 1, Math.floor(yTo));
+      let runStart = -1;
+      for (let y = from; y <= to; y++) {
+        let black = 0;
+        const rowOff = y * width;
+        for (let x = 0; x < width; x++) black += binaryMap[rowOff + x];
+        if (black > EMPTY_ROW_MAX_BLACK) {
+          if (runStart === -1) runStart = y;
+        } else if (runStart !== -1) {
+          clusters.push({ start: runStart, end: y - 1, size: y - runStart, maxLine: y - runStart });
+          runStart = -1;
+        }
+      }
+      if (runStart !== -1) clusters.push({ start: runStart, end: to, size: to + 1 - runStart, maxLine: to + 1 - runStart });
+      return clusters;
+    };
+
+    // c1b) Absatz-Cluster: Textzeilen, die enger als 2.5 Spatia beieinanderliegen,
+    // zu Inhaltsblöcken verschmelzen (ein mehrzeiliger Titel ist EIN Block).
+    const MERGE_GAP_SP = 2.5;
+    // Fettdruck-Display-Titel: mindestens eine Zeile ~2 Spatia hoch, Block >= 2.5.
+    // Kleine Untertitel/Liedtitel (~1-1.3 Spatia Zeilen) loesen nicht aus.
+    // Geometriebasierte Titel-/Copyright-Erkennung (schriftgrößenunabhängig)
+    const DISPLAY_LINE_SP = 1.8;          // Fettdruck-Versalzeile ~2 Spatia
+    const DISPLAY_BLOCK_SP = 2.5;         // Block mit solcher Zeile
+    const ZONE_MIN_SP_HEAD = 18;          // reine Textzone am Kopf: ~20 Spatia
+    const ZONE_MIN_SP_GAP = 15;           // Titelzone im Graben (kürzer)
+    const BOTTOM_GATE = 0.7;              // untere 30% der Seite: kein neuer Titel
+    const COPYRIGHT_MIN_W_FRAC = 0.35;    // breite, flache Zeile = Copyright
+    const findMergedClusters = (yFrom: number, yTo: number): ContentCluster[] => {
+      const maxGap = globalAvgSpatium * MERGE_GAP_SP;
+      const fine = findContentClusters(yFrom, yTo);
+      const merged: ContentCluster[] = [];
+      for (const cl of fine) {
+        const last = merged[merged.length - 1];
+        if (last && cl.start - last.end <= maxGap) {
+          last.end = cl.end;
+          last.size = last.end - last.start;
+          if (cl.maxLine > last.maxLine) last.maxLine = cl.maxLine;
+        } else {
+          merged.push({ ...cl });
+        }
+      }
+      return merged;
+    };
+
+    // Hilfsregeln für Titel-/Copyright-Erkennung (Geometrie, kein OCR)
+    const isDisplayTitle = (cl: ContentCluster) =>
+      cl.size >= globalAvgSpatium * DISPLAY_BLOCK_SP && cl.maxLine >= globalAvgSpatium * DISPLAY_LINE_SP;
+
+    const clusterWidth = (cl: ContentCluster): number => {
+      let cx0 = width, cx1 = -1;
+      for (let y = Math.max(0, cl.start); y <= Math.min(height - 1, cl.end); y++) {
+        const rowOff = y * width;
+        for (let x = 0; x < width; x++) {
+          if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
+            if (x < cx0) cx0 = x;
+            if (x > cx1) cx1 = x;
+          }
+        }
+      }
+      return cx1 >= cx0 ? (cx1 - cx0 + 1) : 0;
+    };
+
+    const isWideShallowLine = (cl: ContentCluster, maxHsp: number, staffSpanX: number) =>
+      cl.start >= height * BOTTOM_GATE &&
+      cl.size < globalAvgSpatium * maxHsp &&
+      clusterWidth(cl) > staffSpanX * COPYRIGHT_MIN_W_FRAC;
+
     // c) Zusammenhängende Läufe von behaltenen Systemen bilden (Klavier trennt)
     type Run = { staves: typeof staves; startIdx: number; endIdx: number };
     const runs: Run[] = [];
@@ -464,7 +539,7 @@ export async function analyzePixels(
 
     // d) Segmentgrenzen bestimmen
     type Segment = { top: number; bottom: number; staffCount: number; startIdx: number; endIdx: number;
-                     firstY1: number; lastY5: number; firstMinX: number; lastMinX: number; minX: number; maxX: number };
+                     firstY1: number; lastY5: number; firstMinX: number; lastMinX: number; minX: number; maxX: number; newPiece: boolean; pseudo?: boolean };
     const segments: Segment[] = [];
 
     for (const run of runs) {
@@ -478,17 +553,71 @@ export async function analyzePixels(
       // vorherigen Klavier-System. So bleiben Übungszeichen/Tempoangaben, die
       // frei über dem Vokal-System schweben, im Segment erhalten.
       let segTop: number;
+      let newPiece = false;
       if (!prevStaff) {
-        // Seitenanfang: auf Seite 1 Kopfzeile/Titel mitnehmen, sonst Standardrand
-        segTop = pageIndex === 1 ? 0 : Math.max(0, Math.floor(firstStaff.y1 - topMargin));
-      } else {
-        const topBands = findEmptyBands(prevStaff.y5 + 1, firstStaff.y1 - 1);
-        const firstBand = topBands.find(b => b.size >= globalAvgSpatium * 3);
-        if (firstBand) {
-          segTop = Math.min(firstBand.end + 1, Math.floor(firstStaff.y1 - globalAvgSpatium * 2));
-          segTop = Math.max(segTop, Math.floor(prevStaff.y5 + 1));
+        // Seitenanfang: auf Seite 1 Kopfzeile/Titel mitnehmen, sonst Standardrand.
+        // Ab Seite 2: steht da ein mehrzeiliger Titel (neues Stück im Heft), mitnehmen.
+        if (pageIndex === 1) {
+          segTop = 0;
         } else {
-          segTop = Math.max(Math.floor(prevStaff.y5 + globalAvgSpatium), Math.floor(firstStaff.y1 - topMargin));
+          // Kopfbereich: reine Textzone ohne Notenlinien. Ab ~20 Spatia Höhe
+          // (Titelvorspann) ODER Fettdruck-Block dabei -> neuer Stückbeginn.
+          // Nie in den unteren 30% (dort steht Copyright, kein Titel).
+          const scanFrom = Math.max(0, Math.floor(firstStaff.y1 - globalAvgSpatium * 50));
+          const headClusters = findMergedClusters(scanFrom, firstStaff.y1 - 1);
+          const headStart = headClusters.length > 0 ? headClusters[0].start : 0;
+          const headSpan = headClusters.length > 0 ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
+          const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
+            (headSpan >= globalAvgSpatium * ZONE_MIN_SP_HEAD || headClusters.some(isDisplayTitle));
+          if (isPieceHead) {
+            newPiece = true;
+            segTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
+          } else {
+            segTop = Math.max(0, Math.floor(firstStaff.y1 - topMargin));
+          }
+        }
+      } else {
+        // Titelerkennung im Graben: hohe reine Textzone (~15+ Spatia) ODER
+        // Fettdruck-Block = neuer Titel. Nie in den unteren 30% der Seite.
+        const gapClusters = findMergedClusters(prevStaff.y5 + 1, firstStaff.y1 - 1);
+        const gapStart = gapClusters.length > 0 ? gapClusters[0].start : 0;
+        const gapSpan = gapClusters.length > 0 ? gapClusters[gapClusters.length - 1].end - gapStart + 1 : 0;
+        const gatedByPosition = gapClusters.length > 0 && gapStart < height * BOTTOM_GATE;
+        const zoneTitle = gatedByPosition && gapSpan >= globalAvgSpatium * ZONE_MIN_SP_GAP;
+        const displayCluster = gatedByPosition ? gapClusters.find(isDisplayTitle) : undefined;
+        const titleStart = zoneTitle ? gapStart : (displayCluster ? displayCluster.start : null);
+
+        if (pageIndex > 1 && titleStart !== null) {
+          newPiece = true;
+          segTop = Math.max(Math.floor(prevStaff.y5 + globalAvgSpatium), Math.floor(titleStart - globalAvgSpatium));
+        } else {
+        // Schnitt in die LETZTE große Lücke vor dem Vokal-System (die Luft direkt
+        // darüber): Alles, was am Klavier klebt – tiefe Basstöne mit Hilfslinien,
+        // Pedalmarken, Klammer – liegt oberhalb dieser Lücke und fällt weg; alles,
+        // was am Vokal-System klebt (Liedtext, Dynamik, Übungszeichen), liegt
+        // unterhalb ihres unteren Endes und bleibt erhalten.
+        const topBands = findEmptyBands(prevStaff.y5 + 1, firstStaff.y1 - 1).filter(b => b.size >= globalAvgSpatium * 1.5);
+        const lastBand = topBands[topBands.length - 1];
+        if (lastBand) {
+          const desired = Math.floor(firstStaff.y1 - globalAvgSpatium * 2);
+          // Wunschposition 2 Spatia über dem System, falls sie in der Lücke liegt;
+          // sonst knapp unterhalb der Lücke (direkt über dem vokalen Inhalt).
+          segTop = (desired >= lastBand.start && desired <= lastBand.end) ? desired : lastBand.end + 1;
+          segTop = Math.min(segTop, Math.floor(firstStaff.y1 - 1));
+          segTop = Math.max(segTop, Math.floor(prevStaff.y5 + globalAvgSpatium));
+        } else {
+          segTop = Math.max(Math.floor(prevStaff.y5 + globalAvgSpatium), Math.floor(firstStaff.y1 - globalAvgSpatium * 4.5));
+        }
+
+        // Copyright-/Verlagszeilen in den unteren 30% weglassen: breite, flache
+        // Textzeile direkt über der Schnittkante (Übungszeichen sind schmal)
+        if (firstStaff.y1 > height * BOTTOM_GATE) {
+          const fineClusters = findContentClusters(prevStaff.y5 + 1, firstStaff.y1 - 1);
+          const lastCl = fineClusters[fineClusters.length - 1];
+          if (lastCl && isWideShallowLine(lastCl, 3, firstStaff.maxX - firstStaff.minX)) {
+            segTop = Math.min(Math.floor(firstStaff.y1 - 1), Math.max(segTop, lastCl.end + 1));
+          }
+        }
         }
       }
 
@@ -507,6 +636,17 @@ export async function analyzePixels(
         } else {
           segBottom = Math.min(Math.floor(nextStaff.y1 - globalAvgSpatium), Math.ceil(lastStaff.y5 + safeMargin));
         }
+
+        // Fussnoten/Copyright in den unteren 30% abschneiden: breite, flache Zeile,
+        // weit weg vom System (Liedtext klebt dagegen < 5 Spatia am System)
+        if (lastStaff.y5 > height * BOTTOM_GATE) {
+          const fineBelow = findContentClusters(lastStaff.y5 + 1, nextStaff.y1 - 1);
+          const footCl = fineBelow[fineBelow.length - 1];
+          if (footCl && footCl.start - lastStaff.y5 >= globalAvgSpatium * 5 &&
+              isWideShallowLine(footCl, 2, lastStaff.maxX - lastStaff.minX)) {
+            segBottom = Math.max(Math.min(segBottom, footCl.start - 1), Math.ceil(lastStaff.y5 + globalAvgSpatium));
+          }
+        }
       }
 
       const top = Math.max(0, Math.floor(segTop));
@@ -515,8 +655,34 @@ export async function analyzePixels(
         segments.push({
           top, bottom, staffCount: run.staves.length, startIdx: run.startIdx, endIdx: run.endIdx,
           firstY1: firstStaff.y1, lastY5: lastStaff.y5, firstMinX: firstStaff.minX, lastMinX: lastStaff.minX,
-          minX: Math.min(...run.staves.map(s => s.minX)), maxX: Math.max(...run.staves.map(s => s.maxX))
+          minX: Math.min(...run.staves.map(s => s.minX)), maxX: Math.max(...run.staves.map(s => s.maxX)),
+          newPiece
         });
+      }
+    }
+
+    // c3) Frontmatter/Titel am Seitenanfang: steht über einem reinen Klavier-Intro
+    // ein grosser Titelblock (ab Seite 2 -> neues Stück im Heft), wird er als
+    // eigener Streifen davor ausgegeben. Titel bleibt, Klavier-Intro bleibt weg.
+    if (pageIndex > 1 && staves.length > 0 && isPiano[0] && segments.length > 0) {
+      const headClusters = findMergedClusters(0, staves[0].y1 - 1);
+      const headStart = headClusters.length > 0 ? headClusters[0].start : 0;
+      const headSpan = headClusters.length > 0 ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
+      const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
+        (headSpan >= globalAvgSpatium * ZONE_MIN_SP_HEAD || headClusters.some(isDisplayTitle));
+      if (isPieceHead) {
+        const fTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
+        const fBottom = Math.min(height, Math.floor(staves[0].y1 - globalAvgSpatium));
+        if (fBottom > fTop) {
+          segments.unshift({
+            top: fTop, bottom: fBottom, staffCount: 0, startIdx: -1, endIdx: -1,
+            firstY1: staves[0].y1, lastY5: staves[0].y5, firstMinX: staves[0].minX, lastMinX: staves[0].minX,
+            minX: staves[0].minX, maxX: staves[0].maxX, newPiece: true, pseudo: true
+          });
+          // Seitenumbruch nur einmal pro Quellseite: der Chortitel darunter
+          // erzwingt dann keinen zweiten Umbruch
+          for (const s of segments) if (!s.pseudo) s.newPiece = false;
+        }
       }
     }
 
@@ -546,13 +712,20 @@ export async function analyzePixels(
       }
 
       const padX = globalAvgSpatium;
-      let cropX0 = contentLeft >= 0 ? contentLeft - padX : seg.minX - 3 * globalAvgSpatium;
-      let cropX1 = contentRight >= 0 ? contentRight + padX : seg.maxX + 2 * globalAvgSpatium;
-      // Sanity: nie in die Systeme hinein schneiden, Ausreißer abfangen
-      cropX0 = Math.min(Math.max(0, Math.floor(cropX0)), Math.floor(seg.minX - globalAvgSpatium * 0.5));
-      cropX1 = Math.max(Math.min(width, Math.ceil(cropX1)), Math.ceil(seg.maxX + globalAvgSpatium * 0.5));
-      if (seg.minX - cropX0 > globalAvgSpatium * 30) cropX0 = Math.floor(seg.minX - 3 * globalAvgSpatium);
-      if (cropX1 - seg.maxX > globalAvgSpatium * 30) cropX1 = Math.ceil(seg.maxX + 2 * globalAvgSpatium);
+      let cropX0: number, cropX1: number;
+      if (seg.pseudo) {
+        // Titel-/Textstreifen: frei auf den Inhalt zuschneiden (keine Systeme)
+        cropX0 = contentLeft >= 0 ? Math.max(0, Math.floor(contentLeft - padX)) : 0;
+        cropX1 = contentRight >= 0 ? Math.min(width, Math.ceil(contentRight + padX)) : width;
+      } else {
+        cropX0 = contentLeft >= 0 ? contentLeft - padX : seg.minX - 3 * globalAvgSpatium;
+        cropX1 = contentRight >= 0 ? contentRight + padX : seg.maxX + 2 * globalAvgSpatium;
+        // Sanity: nie in die Systeme hinein schneiden, Ausreißer abfangen
+        cropX0 = Math.min(Math.max(0, Math.floor(cropX0)), Math.floor(seg.minX - globalAvgSpatium * 0.5));
+        cropX1 = Math.max(Math.min(width, Math.ceil(cropX1)), Math.ceil(seg.maxX + globalAvgSpatium * 0.5));
+        if (seg.minX - cropX0 > globalAvgSpatium * 30) cropX0 = Math.floor(seg.minX - 3 * globalAvgSpatium);
+        if (cropX1 - seg.maxX > globalAvgSpatium * 30) cropX1 = Math.ceil(seg.maxX + 2 * globalAvgSpatium);
+      }
 
       // Streifen in Ausgabe-Auflösung zeichnen (Koordinaten -> Ausgabe-Raum)
       const outX0 = Math.floor(cropX0 * outScale);
@@ -575,7 +748,7 @@ export async function analyzePixels(
       const topZoneEnd = Math.floor(seg.firstY1 * outScale) - outTop - Math.ceil(2 * outScale);
       stripCtx.fillStyle = 'white';
 
-      if (bottomZoneStart < outH) {
+      if (!seg.pseudo && bottomZoneStart < outH) {
         const bandsX = [{ x0: seg.lastMinX - 4, x1: seg.lastMinX + 3 }];
         for (const br of brackets) {
           if (br.type === 'straight' && br.maxY > seg.lastY5 + dangleMin) {
@@ -588,7 +761,7 @@ export async function analyzePixels(
           stripCtx.fillRect(bx0, bottomZoneStart, Math.max(0, bx1 - bx0), outH - bottomZoneStart);
         }
       }
-      if (topZoneEnd > 0 && !(pageIndex === 1 && seg.top === 0)) {
+      if (!seg.pseudo && topZoneEnd > 0 && !(pageIndex === 1 && seg.top === 0)) {
         const bandsX = [{ x0: seg.firstMinX - 4, x1: seg.firstMinX + 3 }];
         for (const br of brackets) {
           if (br.type === 'straight' && br.minY < seg.firstY1 - dangleMin) {
@@ -621,7 +794,8 @@ export async function analyzePixels(
         width: outW,
         // Naturmaße in Millimetern (unabhängig von der Ausgabe-Auflösung)
         widthMm: (outW / outScale) * mmPerPx,
-        heightMm: (outH / outScale) * mmPerPx
+        heightMm: (outH / outScale) * mmPerPx,
+        newPiece: seg.newPiece
       });
 
       // Rote Schnittlinien an Ober-/Unterkante im Debug-Bild
@@ -636,7 +810,11 @@ export async function analyzePixels(
       }
     }
 
-    // f) Stats: Segmente und entfernte Klavier-Läufe in Seitenreihenfolge
+    // f) Stats: Titel-Streifen und Segmente/Klavier-Läufe protokollieren
+    const realSegs = segments.filter(s => !s.pseudo);
+    segments.filter(s => s.pseudo).forEach((seg, k) => {
+      keepRegionsStats += `  -> TITEL-Streifen ${k + 1}: neue Seite, Y ${seg.top} bis ${seg.bottom}  [NEUES STUECK -> Seitenumbruch]\n`;
+    });
     segNumLoop: {
       let pianoRunStart = -1;
       let segIdx = 0;
@@ -648,9 +826,9 @@ export async function analyzePixels(
           keepRegionsStats += `  -> KLAVIER entfernt: ${i - pianoRunStart} System(e), Y ${Math.floor(staves[pianoRunStart].y1)} bis ${Math.floor(staves[i - 1].y5)}\n`;
           pianoRunStart = -1;
         }
-        if (segIdx < segments.length && segments[segIdx].startIdx === i) {
-          const seg = segments[segIdx];
-          keepRegionsStats += `  Segment ${segIdx + 1}: CHOR (${seg.staffCount} Systeme), Y ${seg.top} bis ${seg.bottom}\n`;
+        if (segIdx < realSegs.length && realSegs[segIdx].startIdx === i) {
+          const seg = realSegs[segIdx];
+          keepRegionsStats += `  Segment ${segIdx + 1}: CHOR (${seg.staffCount} Systeme), Y ${seg.top} bis ${seg.bottom}${seg.newPiece ? '  [NEUES STUECK -> Seitenumbruch]' : ''}\n`;
           segIdx++;
         }
       }
