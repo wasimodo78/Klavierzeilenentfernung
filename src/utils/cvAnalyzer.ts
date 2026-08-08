@@ -413,11 +413,94 @@ export async function analyzePixels(
     const bracketTolerance = globalAvgSpatium * 4;
     const curlyBrackets = brackets.filter(b => b.type === 'curly');
 
-    // a) Systeme klassifizieren: Klavier = Systemmitte liegt in einer geschweiften Klammer
-    const isPiano = staves.map(staff => {
-      const centerY = (staff.y1 + staff.y5) / 2;
-      return curlyBrackets.some(b => centerY >= b.minY - bracketTolerance && centerY <= b.maxY + bracketTolerance);
-    });
+    // a) Systeme klassifizieren: Klavier = Systemmitte in geschweifter Klammer –
+    //    ABER: Manche Ausgaben setzen auch die CHOR-Klammer geschweift! Entscheid:
+    //    Ein Chorpaar hat zwischen den zwei Systemen (oder darunter) Liedtext
+    //    (breite satzlange Zeilen), ein Klavierpaar nur kurze Dynamik/Tempo.
+    const LYRIC_SPAN_FRAC = 0.3;   // Zeile muss >= 30% der Systembreite umspannen
+    const LYRIC_MIN_ROWS = 4;
+    const labelRows = new Uint8Array(height);
+    const countWideRows = (y0: number, y1: number, spanMin: number): { wide: number; rows: number } => {
+      let wide = 0, rows = 0;
+      for (let y = Math.max(0, Math.floor(y0)); y <= Math.min(height - 1, Math.floor(y1)); y++) {
+        let rMin = width, rMax = -1;
+        const rowOff = y * width;
+        for (let x = 0; x < width; x++) {
+          if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
+            if (x < rMin) rMin = x;
+            if (x > rMax) rMax = x;
+          }
+        }
+        if (rMax >= rMin) {
+          rows++;
+          if ((rMax - rMin + 1) >= spanMin) wide++;
+        }
+      }
+      return { wide, rows };
+    };
+
+    const isPiano: boolean[] = staves.map(() => false);
+    for (const br of curlyBrackets) {
+      const coveredIdx: number[] = [];
+      for (let i = 0; i < staves.length; i++) {
+        const centerY = (staves[i].y1 + staves[i].y5) / 2;
+        if (centerY >= br.minY - bracketTolerance && centerY <= br.maxY + bracketTolerance) {
+          coveredIdx.push(i);
+        }
+      }
+
+      let vocal = false;
+      let pianoByFiller = false;
+      let lyricEvidence = 0;
+      if (coveredIdx.length === 2) {
+        const up = staves[coveredIdx[0]];
+        const lo = staves[coveredIdx[1]];
+        const spanX = Math.max(up.maxX, lo.maxX) - Math.min(up.minX, lo.minX);
+        // Schluessel: die QUOTE breiter Zeilen im Paar-Zwischenraum.
+        // Klavier durchmusiziert den Raum (nahezu jede Zeile breit, >= 80%),
+        // Liedtext besetzt nur wenige Teilzeilen (4 Zeilen bis ~70%).
+        const band1 = countWideRows(up.y5 + 1, lo.y1 - 1, spanX * LYRIC_SPAN_FRAC);
+        const belowLyrics = countWideRows(lo.y5 + 1, lo.y5 + 1 + globalAvgSpatium * 6, spanX * LYRIC_SPAN_FRAC);
+        const wideFrac = band1.rows > 0 ? band1.wide / band1.rows : 0;
+        pianoByFiller = wideFrac >= 0.8;
+        lyricEvidence = band1.wide + belowLyrics.wide;
+        vocal = !pianoByFiller && (band1.wide + belowLyrics.wide) >= LYRIC_MIN_ROWS;
+      }
+
+      // Signal 2: Beschriftungs-Spalte links der Klammer. In der Chorpartitur-
+    // Praxis steht 'Piano' allein und zentriert auf Klammer-Mitte; Stimmnamen
+    // (Soprano/Alto/Tenor/Bass) stehen an den System-Mitten der Vokalsysteme.
+    let labelPiano = false;
+    if (coveredIdx.length === 2) {
+      const braceCenter = (br.minY + br.maxY) / 2;
+      const labelX0 = Math.max(0, Math.floor(br.minX - globalAvgSpatium * 14));
+      const labelX1 = Math.max(0, Math.floor(br.minX - 1));
+      for (let y = Math.max(0, Math.floor(br.minY - globalAvgSpatium)); y <= Math.min(height - 1, Math.ceil(br.maxY + globalAvgSpatium)); y++) {
+        // einfache Cluster-Vertikalstruktur der Label-Spalte
+        let b = 0;
+        const rowOff = y * width;
+        for (let x = labelX0; x < labelX1; x++) b += binaryMap[rowOff + x];
+        labelRows[y] = b > 0 ? 1 : 0;
+      }
+      // Cluster in der Label-Spalte
+      const labelClusters2: { start: number; end: number }[] = [];
+      let lr = -1;
+      for (let y = Math.max(0, Math.floor(br.minY - globalAvgSpatium)); y <= Math.min(height - 1, Math.ceil(br.maxY + globalAvgSpatium)); y++) {
+        if (labelRows[y]) { if (lr === -1) lr = y; }
+        else if (lr !== -1) { labelClusters2.push({ start: lr, end: y - 1 }); lr = -1; }
+      }
+      if (lr !== -1) labelClusters2.push({ start: lr, end: Math.ceil(br.maxY + globalAvgSpatium) });
+      labelPiano = labelClusters2.some(lc =>
+        Math.abs(((lc.start + lc.end) / 2) - braceCenter) <= globalAvgSpatium * 2.5 &&
+        (lc.end - lc.start) >= globalAvgSpatium * 0.8);
+    }
+
+    const decisionPiano = labelPiano || pianoByFiller ? true : !vocal;
+    keepRegionsStats += `  Klammerpaar Y ${br.minY}-${br.maxY}: labelPiano=${labelPiano ? 'ja' : 'nein'}, quote=${pianoByFiller ? '>=0.8' : '<0.8'}, lyricsRows=${lyricEvidence}, -> ${decisionPiano ? 'KLAVIER' : 'CHOR'}\n`;
+    if (decisionPiano) {
+      for (const i of coveredIdx) isPiano[i] = true;
+    }
+    }
 
     // b) Leere Zeilen-Bänder zwischen zwei Y-Werten finden (Weißraum-Analyse).
     // Akkolade-Linie/Klammer-Ränder erzeugen nur wenige schwarze Pixel pro Zeile
@@ -480,6 +563,7 @@ export async function analyzePixels(
     const BOTTOM_GATE = 0.7;              // untere 30% der Seite: kein neuer Titel
     const COPYRIGHT_MIN_W_FRAC = 0.35;    // breite, flache Zeile = Copyright
     const ZONE_MIN_W_FRAC = 0.22;         // Titelzone: mind. eine Zeile so breit (% Seitenbreite)
+    const TITLE_ZONE_MIN_MM = 22;           // Titelzone: Höhe in mm (Geisterblocks Liedtext+Dynamik ~7-10mm)
     const DETACH_SP = 1.8;                // Titel haengt nie am Satz: echter Abstand noetig
     const findMergedClusters = (yFrom: number, yTo: number): ContentCluster[] => {
       const maxGap = globalAvgSpatium * MERGE_GAP_SP;
@@ -596,8 +680,9 @@ export async function analyzePixels(
           const coverage = headSpan > 0 ? sumH / headSpan : 0;
           // Dicht gepackte Textzone (viel Text auf engem Raum) = Titelvorspann;
           // vereinzelte Kopf-/Tempozeilen mit grossen Abständen dagegen nicht
+          const headSpanMm = headSpan * mmPerPx;
           const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
-            ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters)) || headClusters.some(isDisplayTitle));
+            ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters) && headSpanMm >= TITLE_ZONE_MIN_MM));
           if (isPieceHead) {
             newPiece = true;
             segTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
@@ -619,9 +704,8 @@ export async function analyzePixels(
         const detachedAbove = gapClusters.length > 0 && gapStart - prevStaff.y5 >= globalAvgSpatium * DETACH_SP;
         const sumH = detachedAbove ? gapClusters.reduce((s, cl) => s + cl.size, 0) : 0;
         const coverage = gapSpan > 0 ? sumH / gapSpan : 0;
-        const zoneTitle = gatedByPosition && detachedAbove && gapClusters.length > 0 && sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(gapClusters);
-        const displayCluster = gatedByPosition && detachedAbove ? gapClusters.find(isDisplayTitle) : undefined;
-        const titleStart = zoneTitle ? gapStart : (displayCluster ? displayCluster.start : null);
+        const zoneTitle = gatedByPosition && detachedAbove && gapClusters.length > 0 && sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(gapClusters) && gapSpan * mmPerPx >= TITLE_ZONE_MIN_MM;
+        const titleStart = zoneTitle ? gapStart : null;
 
         if (pageIndex > 1 && titleStart !== null) {
           newPiece = true;
@@ -683,15 +767,16 @@ export async function analyzePixels(
     // ein grosser Titelblock (ab Seite 2 -> neues Stück im Heft), wird er als
     // eigener Streifen davor ausgegeben. Titel bleibt, Klavier-Intro bleibt weg.
     if (pageIndex > 1 && staves.length > 0 && isPiano[0] && segments.length > 0) {
+      // Kein Detach-Gate hier: direkt ueber dem Klavier-Intro ist der
+      // Tempo-Vermerk Satz gehoerig und gehoert zum Titelvorspann dazu.
       const headClusters = findMergedClusters(0, Math.floor(staves[0].y1 - Math.ceil(globalAvgSpatium)));
-      const detachedBelow = headClusters.length === 0 ||
-        headClusters[headClusters.length - 1].end <= staves[0].y1 - globalAvgSpatium * DETACH_SP;
-      const headStart = headClusters.length > 0 && detachedBelow ? headClusters[0].start : 0;
-      const headSpan = headClusters.length > 0 && detachedBelow ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
-      const sumH = detachedBelow ? headClusters.reduce((s, cl) => s + cl.size, 0) : 0;
+      const headStart = headClusters.length > 0 ? headClusters[0].start : 0;
+      const headSpan = headClusters.length > 0 ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
+      const sumH = headClusters.reduce((s, cl) => s + cl.size, 0);
       const coverage = headSpan > 0 ? sumH / headSpan : 0;
       const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
-        ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters)) || headClusters.some(isDisplayTitle));
+        ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters) && headSpan * mmPerPx >= TITLE_ZONE_MIN_MM));
+      keepRegionsStats += `  [KOPF-VORSPANN? start=${headStart} span=${headSpan.toFixed(0)} sumH=${sumH.toFixed(0)} cov=${coverage.toFixed(2)} fire=${isPieceHead ? 'ja' : 'nein'}]\n`;
       if (isPieceHead) {
         const fTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
         const fBottom = Math.min(height, Math.floor(staves[0].y1 - globalAvgSpatium));
