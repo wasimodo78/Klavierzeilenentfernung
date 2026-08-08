@@ -87,3 +87,49 @@ Um das PDF nicht nur als Sammlung von Linien, sondern semantisch als Partitur zu
    - *Konsequenz für die App:* Der linke Rand (die X-Koordinate der Akkoladenstrichs / der Klammern) springt. Ein simpler vertikaler Scan an X=0 oder X=20 wird fehlschlagen. Die Klammernerkennung muss die X-Koordinate flexibel über die Breite suchen, kann aber davon ausgehen, dass alle Folgesysteme ab dem zweiten System linksbündig auf der gleichen X-Achse starten.
 
 Diese typografischen Regeln sind essenziell, um das PDF wie ein Musiknotationsprogramm zu lesen und nicht wie ein dummes Bild-Zuschneide-Tool.
+---
+
+## Workflow für Mensch + KI (Stand v12, validiert)
+
+Dieses Projekt wurde in enger Zusammenarbeit von Mensch und KI entwickelt und ist auf diesen
+Workflow kalibriert. Er macht Änderungen an der Erkennung gefahrlos wiederholbar.
+
+### Grundsätze
+
+1. **Messen in Proportionen, nicht in Pixeln.** Alle geometrischen Regeln arbeiten in
+   Spatia (Notenlinienabstand), Millimetern oder Seitenbruchteilen – niemals in absoluten
+   Pixelwerten. Auflösung (300/600 dpi) und Seitengröße sind Variablen, keine Konstanten.
+2. **Keine KI-/Online-Abhängigkeit zur Laufzeit.** Erkennung ist lokale, deterministische
+   Computer Vision. Alles läuft offline im Browser.
+3. **Reale Dateien schlagen Theorie.** Jede Änderung an Erkennung/Schnitt wird erst lokal
+   gegen die Original-PDFs verifiziert, bevor sie der Nutzer testet.
+
+### Test-Referenzen (Fixtures)
+
+- Im Repository `main` liegen Referenz-PDFs (`4_seiten_test.pdf`, `disney3b.pdf`) als
+  Regressionstests: Mary-Poppins-Stil (gerade Chor-Klammer) und Hal-Leonard-Medley-Stil
+  (teilweise geschweifte Chor-Klammer, viele Sonderfälle: Titelblöcke, Legatobögen,
+  Probezeichen-Kästchen, Copyright-Zonen).
+- **Konvention für den Menschen:** Neue Probematerialien lädt der Mensch selbst über die
+  GitHub-Oberfläche hoch ("Add file" → "Upload files" → direkt auf `main`). So schlagen
+  Chat-Upload-Störungen nicht fehl, und die KI kann jederzeit reproduzieren.
+- **Konvention für die KI:** Nach jedem Bug-Report zuerst lokal reproduzieren:
+  Node-Harness mit `@napi-rs/canvas` + `pdfjs-dist` (analyzePixels mit DOM-Shim), Diagnose
+  an echten Pixeln/Statistiken, Fix, Ergebnisbilder vor/nach prüfen, dann Commit.
+  Kein Raten, keine Hin-und-Her-Fragerei.
+
+### Dev-Preview (Arena/e2b)
+
+- Die Vorschau läuft eingebettet; Browser blockieren dort programmgesteuerte Downloads
+  und Speicher-Dialoge. Die App bietet deshalb: File System Access API (nativer Dialog),
+  Dev-Server-Direkt-Download (Content-Disposition: attachment), Link-Fallback.
+- **Rollback-Disziplin:** Dev-Umgebungen (Sandboxen) werden gelegentlich auf den Repo-
+  Stand zurückgesetzt; ungebundene Änderungen gehen verloren. Deshalb: **Commits nach
+  jedem validierten Zwischenstand pushen**; verlorene Umgebungen per
+  `git fetch + git reset --mixed` wieder anklemmen; `node_modules` per `npm install` erneuern.
+
+### Diagnose-Werkzeuge (absichtlich sichtbar, Teil der App)
+
+- CV-Inspektor (Debug 1) und Vektor-Inspektor (Debug 2) unter dem Upload-Bereich.
+- Per-Seite-Diagnose im Hauptworkflow: Erkennungsbild + Statistik (Akkoladen, Klammern,
+  Klammerpaar-Entscheidungen labelPiano/Quote/lyricsRows, Segmente, Titel-Entscheide).

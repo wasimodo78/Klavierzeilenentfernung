@@ -609,7 +609,7 @@ export default function App() {
                           src={img.dataUrl} 
                           alt={`System ${idx + 1}`} 
                           className="h-auto object-contain"
-                          style={{ width: `${(layoutSize(img).wMm / CONTENT_WIDTH_MM) * 100}%` }}
+                          style={{ width: `${(layoutSize(img).wMm / CONTENT_WIDTH_MM) * 100}%`, marginLeft: `${((CONTENT_WIDTH_MM - layoutSize(img).wMm) / 2 / CONTENT_WIDTH_MM) * 100}%` }}
                         />
                       </div>
                     ))}
@@ -628,7 +628,7 @@ export default function App() {
                                src={item.img.dataUrl}
                                alt={`Seite ${pageIdx + 1} - System ${sysIdx + 1}`}
                                className="object-contain object-top"
-                               style={{ width: `${(item.wMm / CONTENT_WIDTH_MM) * 100}%` }}
+                               style={{ width: `${(item.wMm / CONTENT_WIDTH_MM) * 100}%`, marginLeft: `${(item.xMm - 10) / CONTENT_WIDTH_MM * 100}%` }}
                              />
                            ))}
                         </div>

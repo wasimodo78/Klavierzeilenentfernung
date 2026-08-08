@@ -9,7 +9,7 @@ type Region = { start: number; end: number; type: 'ink' | 'gap' };
 
 export type ExtractedSystem = { dataUrl: string; width: number; height: number; widthMm?: number; heightMm?: number; newPiece?: boolean };
 
-export type PlacedSystem = { img: ExtractedSystem; wMm: number; hMm: number };
+export type PlacedSystem = { img: ExtractedSystem; wMm: number; hMm: number; xMm: number };
 
 export async function extractSystems(
   file: File,
@@ -327,7 +327,9 @@ export function groupSystemsIntoPages(images: ExtractedSystem[]): PlacedSystem[]
       currentY = MARGIN_MM;
     }
 
-    pages[pages.length - 1].push({ img, wMm, hMm });
+    // Horizontal zentriert auf der Inhaltsbreite platzieren (Naturmaß bleibt)
+    const xMm = MARGIN_MM + Math.max(0, (PAGE_LAYOUT.A4_WIDTH_MM - 2 * MARGIN_MM - wMm) / 2);
+    pages[pages.length - 1].push({ img, wMm, hMm, xMm });
     currentY += hMm + GAP_MM;
   }
 
@@ -373,7 +375,9 @@ export async function generatePdf(
 
     // Format aus der Data-URL erkennen (1-Bit Ausgabe kommt als PNG)
     const imgFormat = img.dataUrl.startsWith('data:image/png') ? 'PNG' : 'JPEG';
-    outPdf.addImage(img.dataUrl, imgFormat, margin, currentY, wMm, hMm, undefined, 'FAST');
+    // wie Vorschau: zentriert auf der Inhaltsbreite
+    const xMm = margin + Math.max(0, (contentWidth - wMm) / 2);
+    outPdf.addImage(img.dataUrl, imgFormat, xMm, currentY, wMm, hMm, undefined, 'FAST');
     currentY += hMm + gap; 
   }
 
