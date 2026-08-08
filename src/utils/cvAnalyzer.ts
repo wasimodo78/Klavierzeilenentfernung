@@ -849,37 +849,44 @@ export async function analyzePixels(
       stripCtx.fillRect(0, 0, outW, outH);
       stripCtx.drawImage(outCanvas, outX0, outTop, outW, outH, 0, 0, outW, outH);
 
-      // Überhängende Reste des Akkoladen-Verbunds weiss übermalen
-      const dangleMin = globalAvgSpatium * 1.5;
+      // Überhängende Reste des Akkoladen-Verbunds weiss übermalen – nicht über
+      // fixe X-Bänder (die passen nur, wenn Strich/Klammer genau bei minX sitzen),
+      // sondern pixelgenau: Spalten in der Schnittzone, die dort durchgehend
+      // schwarz sind (>= 70% der Zonenzeilen), sind per Definition Überrest.
       const bottomZoneStart = Math.floor(seg.lastY5 * outScale) - outTop + Math.ceil(3 * outScale);
       const topZoneEnd = Math.floor(seg.firstY1 * outScale) - outTop - Math.ceil(2 * outScale);
       stripCtx.fillStyle = 'white';
 
-      if (!seg.pseudo && bottomZoneStart < outH) {
-        const bandsX = [{ x0: seg.lastMinX - 4, x1: seg.lastMinX + 3 }];
-        for (const br of brackets) {
-          if (br.type === 'straight' && br.maxY > seg.lastY5 + dangleMin) {
-            bandsX.push({ x0: br.minX - 1, x1: br.maxX + 1 });
+      const detectDangleCols = (zoneStart: number, zoneEnd: number): number[] => {
+        const cols: number[] = [];
+        const z0 = Math.max(0, Math.floor(zoneStart));
+        const z1 = Math.min(height - 1, Math.floor(zoneEnd));
+        const zoneH = z1 - z0 + 1;
+        if (zoneH <= 0) return cols;
+        const x0 = Math.max(0, Math.floor(seg.minX - globalAvgSpatium * 2.5));
+        const x1 = Math.min(width - 1, Math.ceil(Math.max(seg.firstMinX, seg.lastMinX) + 3));
+        for (let x = x0; x <= x1; x++) {
+          let black = 0;
+          for (let y = z0; y <= z1; y++) {
+            if (binaryMap[y * width + x] === 1) black++;
           }
+          if (black / zoneH >= 0.7) cols.push(x);
         }
-        for (const b of bandsX) {
-          const bx0 = Math.max(outX0, Math.floor(b.x0 * outScale)) - outX0;
-          const bx1 = Math.min(outX1, Math.ceil(b.x1 * outScale)) - outX0;
-          stripCtx.fillRect(bx0, bottomZoneStart, Math.max(0, bx1 - bx0), outH - bottomZoneStart);
+        return cols;
+      };
+      const eraseCols = (cols: number[], zoneOutStart: number, zoneOutEnd: number) => {
+        for (const col of cols) {
+          const bx = Math.floor(col * outScale) - outX0;
+          const w = Math.ceil(2 * outScale) + 1;
+          stripCtx.fillRect(Math.max(0, bx - Math.floor(w / 2)), zoneOutStart, w, Math.max(0, zoneOutEnd - zoneOutStart));
         }
+      };
+
+      if (!seg.pseudo && bottomZoneStart < outH) {
+        eraseCols(detectDangleCols(seg.lastY5 + 2, seg.bottom - 1), bottomZoneStart, outH);
       }
       if (!seg.pseudo && topZoneEnd > 0 && !(pageIndex === 1 && seg.top === 0)) {
-        const bandsX = [{ x0: seg.firstMinX - 4, x1: seg.firstMinX + 3 }];
-        for (const br of brackets) {
-          if (br.type === 'straight' && br.minY < seg.firstY1 - dangleMin) {
-            bandsX.push({ x0: br.minX - 1, x1: br.maxX + 1 });
-          }
-        }
-        for (const b of bandsX) {
-          const bx0 = Math.max(outX0, Math.floor(b.x0 * outScale)) - outX0;
-          const bx1 = Math.min(outX1, Math.ceil(b.x1 * outScale)) - outX0;
-          stripCtx.fillRect(bx0, 0, Math.max(0, bx1 - bx0), topZoneEnd);
-        }
+        eraseCols(detectDangleCols(seg.top + 1, seg.firstY1 - 2), 0, topZoneEnd);
       }
 
       // Optional: 1-Bit Schwarz-Weiss (gestochen scharfe Kanten, kleine PNG-Datei,
