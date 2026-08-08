@@ -1,10 +1,15 @@
 export async function analyzePixels(
   canvas: HTMLCanvasElement,
   onProgress: (msg: string) => void,
-  pageIndex: number = 1
-): Promise<{ debugImage: string, stats: string, croppedStrips: { dataUrl: string, height: number }[] }> {
+  pageIndex: number = 1,
+  output?: { canvas: HTMLCanvasElement; bilevel: boolean }
+): Promise<{ debugImage: string, stats: string, croppedStrips: { dataUrl: string, height: number, width: number }[] }> {
   onProgress("Starte Bildanalyse (Binarisierung)...");
   const ctx = canvas.getContext('2d')!;
+  // Ausgabe erfolgt optional aus einem separaten hochauflösenden Render
+  const outCanvas = output?.canvas ?? canvas;
+  const outScale = outCanvas.width / canvas.width;
+  const outBilevel = output?.bilevel ?? false;
   const width = canvas.width;
   const height = canvas.height;
   const imgData = ctx.getImageData(0, 0, width, height);
@@ -41,6 +46,15 @@ export async function analyzePixels(
       data[i+1] = 255;
       data[i+2] = 255;
     }
+  }
+
+  // Seitenrahmen des Verlags erkennen: Spalten, die fast durchgehend schwarz sind,
+  // werden beim späteren X-Zuschnitt nicht als Inhalt gewertet.
+  const frameCols = new Uint8Array(width);
+  for (let fx = 0; fx < width; fx++) {
+    let colBlack = 0;
+    for (let fy = 0; fy < height; fy++) colBlack += binaryMap[fy * width + fx];
+    if (colBlack > height * 0.97) frameCols[fx] = 1;
   }
 
   onProgress("Suche nach Notenlinien (Run-Length)...");
@@ -382,72 +396,258 @@ export async function analyzePixels(
     }
   }
 
-  const croppedStrips: { dataUrl: string, height: number }[] = [];
+  // --- 7. Segmentbasiertes Schneiden ---
+  // Statt Akkoladen nur an den Außenkanten zu beschneiden, bilden wir aus den
+  // Nicht-Klavier-Systemen zusammenhängende Keep-Segmente. Klavier-Läufe
+  // (geschweifte Klammer) fallen so auch mitten auf der Seite als Lücke heraus –
+  // unabhängig davon, wie die Akkolade-Gruppierung ausgefallen ist.
+  const croppedStrips: { dataUrl: string, height: number, width: number }[] = [];
   let keepRegionsStats = '';
-  if (akkoladen.length > 0) {
-    const globalAvgSpatium = staves.reduce((s, st) => s + st.spatium, 0) / staves.length;
-    // Exactly 5 spatiums below the lowest non-piano line as requested
-    const safeMargin = Math.floor(globalAvgSpatium * 5); 
-    const topMargin = Math.floor(globalAvgSpatium * 8); // Margin at the top of subsequent akkoladen
 
-    for (let i = 0; i < akkoladen.length; i++) {
-      const akk = akkoladen[i];
-      // Find curly brackets that vertically overlap with this akkolade
-      const akkCurlyBrackets = brackets.filter(b => b.type === 'curly' && b.minY < akk.endY && b.maxY > akk.startY);
-      
-      const bracketTolerance = globalAvgSpatium * 4;
-      
-      let keepStaves = akk.staves;
-      if (akkCurlyBrackets.length > 0) {
-        // "Schneide doch einfach alle Systeme mit der geschweiften Klammer ab."
-        // We filter out any staff that falls within the vertical bounds of a curly bracket.
-        keepStaves = akk.staves.filter(staff => {
-          const centerY = (staff.y1 + staff.y5) / 2;
-          return !akkCurlyBrackets.some(b => centerY >= b.minY - bracketTolerance && centerY <= b.maxY + bracketTolerance);
+  if (staves.length > 0) {
+    const globalAvgSpatium = staves.reduce((s, st) => s + st.spatium, 0) / staves.length;
+    const safeMargin = Math.floor(globalAvgSpatium * 5);
+    const topMargin = Math.floor(globalAvgSpatium * 8);
+    const bracketTolerance = globalAvgSpatium * 4;
+    const curlyBrackets = brackets.filter(b => b.type === 'curly');
+
+    // a) Systeme klassifizieren: Klavier = Systemmitte liegt in einer geschweiften Klammer
+    const isPiano = staves.map(staff => {
+      const centerY = (staff.y1 + staff.y5) / 2;
+      return curlyBrackets.some(b => centerY >= b.minY - bracketTolerance && centerY <= b.maxY + bracketTolerance);
+    });
+
+    // b) Leere Zeilen-Bänder zwischen zwei Y-Werten finden (Weißraum-Analyse).
+    // Akkolade-Linie/Klammer-Ränder erzeugen nur wenige schwarze Pixel pro Zeile
+    // und fallen unter den Schwellwert, Text und Noten liegen deutlich darüber.
+    const EMPTY_ROW_MAX_BLACK = Math.max(6, Math.floor(width * 0.003));
+    type EmptyBand = { start: number; end: number; size: number };
+    const findEmptyBands = (yFrom: number, yTo: number): EmptyBand[] => {
+      const bands: EmptyBand[] = [];
+      const from = Math.max(0, Math.floor(yFrom));
+      const to = Math.min(height - 1, Math.floor(yTo));
+      let runStart = -1;
+      for (let y = from; y <= to; y++) {
+        let black = 0;
+        const rowOff = y * width;
+        for (let x = 0; x < width; x++) black += binaryMap[rowOff + x];
+        if (black <= EMPTY_ROW_MAX_BLACK) {
+          if (runStart === -1) runStart = y;
+        } else if (runStart !== -1) {
+          bands.push({ start: runStart, end: y - 1, size: y - runStart });
+          runStart = -1;
+        }
+      }
+      if (runStart !== -1) bands.push({ start: runStart, end: to, size: to + 1 - runStart });
+      return bands;
+    };
+
+    // c) Zusammenhängende Läufe von behaltenen Systemen bilden (Klavier trennt)
+    type Run = { staves: typeof staves; startIdx: number; endIdx: number };
+    const runs: Run[] = [];
+    let currentRun: Run | null = null;
+    staves.forEach((staff, idx) => {
+      if (!isPiano[idx]) {
+        if (!currentRun) {
+          currentRun = { staves: [staff], startIdx: idx, endIdx: idx };
+          runs.push(currentRun);
+        } else {
+          currentRun.staves.push(staff);
+          currentRun.endIdx = idx;
+        }
+      } else {
+        currentRun = null;
+      }
+    });
+
+    // d) Segmentgrenzen bestimmen
+    type Segment = { top: number; bottom: number; staffCount: number; startIdx: number; endIdx: number;
+                     firstY1: number; lastY5: number; firstMinX: number; lastMinX: number; minX: number; maxX: number };
+    const segments: Segment[] = [];
+
+    for (const run of runs) {
+      const firstStaff = run.staves[0];
+      const lastStaff = run.staves[run.staves.length - 1];
+      // Läufe werden nur von Klavier-Systemen getrennt, daher gilt:
+      const prevStaff = run.startIdx > 0 ? staves[run.startIdx - 1] : null; // immer Klavier
+      const nextStaff = run.endIdx < staves.length - 1 ? staves[run.endIdx + 1] : null; // immer Klavier
+
+      // Oberkante: knapp unterhalb der ersten echten Weißraum-Band unter dem
+      // vorherigen Klavier-System. So bleiben Übungszeichen/Tempoangaben, die
+      // frei über dem Vokal-System schweben, im Segment erhalten.
+      let segTop: number;
+      if (!prevStaff) {
+        // Seitenanfang: auf Seite 1 Kopfzeile/Titel mitnehmen, sonst Standardrand
+        segTop = pageIndex === 1 ? 0 : Math.max(0, Math.floor(firstStaff.y1 - topMargin));
+      } else {
+        const topBands = findEmptyBands(prevStaff.y5 + 1, firstStaff.y1 - 1);
+        const firstBand = topBands.find(b => b.size >= globalAvgSpatium * 3);
+        if (firstBand) {
+          segTop = Math.min(firstBand.end + 1, Math.floor(firstStaff.y1 - globalAvgSpatium * 2));
+          segTop = Math.max(segTop, Math.floor(prevStaff.y5 + 1));
+        } else {
+          segTop = Math.max(Math.floor(prevStaff.y5 + globalAvgSpatium), Math.floor(firstStaff.y1 - topMargin));
+        }
+      }
+
+      // Unterkante: Mitte der größten Weißraum-Lücke zum nächsten Klavier-System,
+      // damit Liedtext unter dem letzten Vokal-System erhalten bleibt.
+      let segBottom: number;
+      if (!nextStaff) {
+        segBottom = Math.min(height, Math.ceil(lastStaff.y5 + safeMargin));
+      } else {
+        const bottomBands = findEmptyBands(lastStaff.y5 + 1, nextStaff.y1 - 1);
+        const bestBand = bottomBands.filter(b => b.size >= globalAvgSpatium * 2).sort((a, b) => b.size - a.size)[0];
+        if (bestBand) {
+          segBottom = bestBand.start + Math.floor(bestBand.size / 2);
+          segBottom = Math.min(segBottom, Math.floor(nextStaff.y1 - globalAvgSpatium));
+          segBottom = Math.max(segBottom, Math.ceil(lastStaff.y5 + globalAvgSpatium * 2));
+        } else {
+          segBottom = Math.min(Math.floor(nextStaff.y1 - globalAvgSpatium), Math.ceil(lastStaff.y5 + safeMargin));
+        }
+      }
+
+      const top = Math.max(0, Math.floor(segTop));
+      const bottom = Math.min(height, Math.ceil(segBottom));
+      if (bottom > top) {
+        segments.push({
+          top, bottom, staffCount: run.staves.length, startIdx: run.startIdx, endIdx: run.endIdx,
+          firstY1: firstStaff.y1, lastY5: lastStaff.y5, firstMinX: firstStaff.minX, lastMinX: lastStaff.minX,
+          minX: Math.min(...run.staves.map(s => s.minX)), maxX: Math.max(...run.staves.map(s => s.maxX))
         });
       }
-      
-      // If we filtered out ALL staves (meaning the system ONLY had curly brackets),
-      // we skip this akkolade entirely as per the user's request: "Schneid es einfach immer weg."
-      if (keepStaves.length === 0) {
-          keepRegionsStats += `  Region ${i+1}: NUR PIANO (übersprungen)\n`;
-          continue;
-      } else {
-          keepRegionsStats += `  Region ${i+1}: CHOR (${keepStaves.length} Systeme)\n`;
-      }
+    }
 
-      const highestKeepStaff = keepStaves[0];
-      const lowestKeepStaff = keepStaves[keepStaves.length - 1];
-      
-      let keepStartY = Math.max(0, highestKeepStaff.y1 - topMargin);
-      let keepEndY = Math.min(height, lowestKeepStaff.y5 + safeMargin);
+    // e) Streifen erzeugen (mit X-Zuschnitt auf den tatsächlichen Inhalt) +
+    //    Schnittlinien im Debug-Bild (rot, oben und unten)
+    for (const seg of segments) {
+      const h = seg.bottom - seg.top;
 
-      if (i === 0 && pageIndex === 1) {
-        // Keep from top of page for the very first akkolade to preserve the title/header
-        keepStartY = 0;
-      }
-
-      const h = keepEndY - keepStartY;
-      if (h > 0) {
-          const stripCanvas = document.createElement('canvas');
-          stripCanvas.width = width;
-          stripCanvas.height = h;
-          const stripCtx = stripCanvas.getContext('2d')!;
-          stripCtx.fillStyle = 'white';
-          stripCtx.fillRect(0, 0, width, h);
-          stripCtx.drawImage(canvas, 0, keepStartY, width, h, 0, 0, width, h);
-          croppedStrips.push({ dataUrl: stripCanvas.toDataURL('image/jpeg', 0.9), height: h });
-          keepRegionsStats += `  Region ${i+1}: Y ${Math.floor(keepStartY)} bis ${Math.floor(keepEndY)} (Staves kept: ${keepStaves.length})\n`;
-
-          // Draw a thick red line at the cut point on the debug image for visual feedback
-          for (let y = Math.floor(keepEndY) - 2; y <= Math.floor(keepEndY) + 2; y++) {
-             for (let x = 0; x < width; x++) {
-                if (y >= 0 && y < height) {
-                   const idx = (y * width + x) * 4;
-                   data[idx] = 255; data[idx+1] = 0; data[idx+2] = 0;
-                }
-             }
+      // Inhaltsgrenzen links/rechts bestimmen (Klammern, Stimmnamen, Taktnummern).
+      // Seitenrahmen des Verlags (fast durchgehend schwarze Spalten) zählen nicht.
+      let contentLeft = -1;
+      let contentRight = -1;
+      const leftScanEnd = Math.max(0, Math.floor(seg.minX));
+      const rightScanStart = Math.min(width, Math.ceil(seg.maxX));
+      for (let y = seg.top; y < seg.bottom; y++) {
+        const rowOff = y * width;
+        for (let x = 0; x < leftScanEnd; x++) {
+          if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
+            if (contentLeft === -1 || x < contentLeft) contentLeft = x;
           }
+        }
+        for (let x = rightScanStart; x < width; x++) {
+          if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
+            if (x > contentRight) contentRight = x;
+          }
+        }
+      }
+
+      const padX = globalAvgSpatium;
+      let cropX0 = contentLeft >= 0 ? contentLeft - padX : seg.minX - 3 * globalAvgSpatium;
+      let cropX1 = contentRight >= 0 ? contentRight + padX : seg.maxX + 2 * globalAvgSpatium;
+      // Sanity: nie in die Systeme hinein schneiden, Ausreißer abfangen
+      cropX0 = Math.min(Math.max(0, Math.floor(cropX0)), Math.floor(seg.minX - globalAvgSpatium * 0.5));
+      cropX1 = Math.max(Math.min(width, Math.ceil(cropX1)), Math.ceil(seg.maxX + globalAvgSpatium * 0.5));
+      if (seg.minX - cropX0 > globalAvgSpatium * 30) cropX0 = Math.floor(seg.minX - 3 * globalAvgSpatium);
+      if (cropX1 - seg.maxX > globalAvgSpatium * 30) cropX1 = Math.ceil(seg.maxX + 2 * globalAvgSpatium);
+
+      // Streifen in Ausgabe-Auflösung zeichnen (Koordinaten -> Ausgabe-Raum)
+      const outX0 = Math.floor(cropX0 * outScale);
+      const outX1 = Math.ceil(cropX1 * outScale);
+      const outW = outX1 - outX0;
+      const outTop = Math.floor(seg.top * outScale);
+      const outH = Math.max(1, Math.ceil(seg.bottom * outScale) - outTop);
+
+      const stripCanvas = document.createElement('canvas');
+      stripCanvas.width = outW;
+      stripCanvas.height = outH;
+      const stripCtx = stripCanvas.getContext('2d')!;
+      stripCtx.fillStyle = 'white';
+      stripCtx.fillRect(0, 0, outW, outH);
+      stripCtx.drawImage(outCanvas, outX0, outTop, outW, outH, 0, 0, outW, outH);
+
+      // Überhängende Reste des Akkoladen-Verbunds weiss übermalen
+      const dangleMin = globalAvgSpatium * 1.5;
+      const bottomZoneStart = Math.floor(seg.lastY5 * outScale) - outTop + Math.ceil(3 * outScale);
+      const topZoneEnd = Math.floor(seg.firstY1 * outScale) - outTop - Math.ceil(2 * outScale);
+      stripCtx.fillStyle = 'white';
+
+      if (bottomZoneStart < outH) {
+        const bandsX = [{ x0: seg.lastMinX - 4, x1: seg.lastMinX + 3 }];
+        for (const br of brackets) {
+          if (br.type === 'straight' && br.maxY > seg.lastY5 + dangleMin) {
+            bandsX.push({ x0: br.minX - 1, x1: br.maxX + 1 });
+          }
+        }
+        for (const b of bandsX) {
+          const bx0 = Math.max(outX0, Math.floor(b.x0 * outScale)) - outX0;
+          const bx1 = Math.min(outX1, Math.ceil(b.x1 * outScale)) - outX0;
+          stripCtx.fillRect(bx0, bottomZoneStart, Math.max(0, bx1 - bx0), outH - bottomZoneStart);
+        }
+      }
+      if (topZoneEnd > 0 && !(pageIndex === 1 && seg.top === 0)) {
+        const bandsX = [{ x0: seg.firstMinX - 4, x1: seg.firstMinX + 3 }];
+        for (const br of brackets) {
+          if (br.type === 'straight' && br.minY < seg.firstY1 - dangleMin) {
+            bandsX.push({ x0: br.minX - 1, x1: br.maxX + 1 });
+          }
+        }
+        for (const b of bandsX) {
+          const bx0 = Math.max(outX0, Math.floor(b.x0 * outScale)) - outX0;
+          const bx1 = Math.min(outX1, Math.ceil(b.x1 * outScale)) - outX0;
+          stripCtx.fillRect(bx0, 0, Math.max(0, bx1 - bx0), topZoneEnd);
+        }
+      }
+
+      // Optional: 1-Bit Schwarz-Weiss (gestochen scharfe Kanten, kleine PNG-Datei,
+      // Grauschleier aus Scans wird zu reinem Weiss)
+      if (outBilevel) {
+        const img = stripCtx.getImageData(0, 0, outW, outH);
+        const px = img.data;
+        for (let p = 0; p < px.length; p += 4) {
+          const lum = 0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2];
+          const v = lum < 200 ? 0 : 255;
+          px[p] = v; px[p + 1] = v; px[p + 2] = v; px[p + 3] = 255;
+        }
+        stripCtx.putImageData(img, 0, 0);
+      }
+
+      croppedStrips.push({
+        dataUrl: outBilevel ? stripCanvas.toDataURL('image/png') : stripCanvas.toDataURL('image/jpeg', 0.92),
+        height: outH,
+        width: outW
+      });
+
+      // Rote Schnittlinien an Ober-/Unterkante im Debug-Bild
+      for (const lineY of [seg.top, seg.bottom]) {
+        for (let y = lineY - 2; y <= lineY + 2; y++) {
+          if (y < 0 || y >= height) continue;
+          for (let x = 0; x < width; x++) {
+            const i = (y * width + x) * 4;
+            data[i] = 255; data[i + 1] = 0; data[i + 2] = 0;
+          }
+        }
+      }
+    }
+
+    // f) Stats: Segmente und entfernte Klavier-Läufe in Seitenreihenfolge
+    segNumLoop: {
+      let pianoRunStart = -1;
+      let segIdx = 0;
+      for (let i = 0; i <= staves.length; i++) {
+        const pianoHere = i < staves.length && isPiano[i];
+        if (pianoHere && pianoRunStart === -1) {
+          pianoRunStart = i;
+        } else if (!pianoHere && pianoRunStart !== -1) {
+          keepRegionsStats += `  -> KLAVIER entfernt: ${i - pianoRunStart} System(e), Y ${Math.floor(staves[pianoRunStart].y1)} bis ${Math.floor(staves[i - 1].y5)}\n`;
+          pianoRunStart = -1;
+        }
+        if (segIdx < segments.length && segments[segIdx].startIdx === i) {
+          const seg = segments[segIdx];
+          keepRegionsStats += `  Segment ${segIdx + 1}: CHOR (${seg.staffCount} Systeme), Y ${seg.top} bis ${seg.bottom}\n`;
+          segIdx++;
+        }
       }
     }
   }
@@ -473,7 +673,7 @@ Spatium (Durchschnitt): ${staves.length > 0 ? (staves.reduce((s, st) => s + st.s
     stats += `  Klammer ${i+1}: ${br.type} (X: ${Math.floor(br.minX)} bis ${Math.floor(br.maxX)}, Y: ${Math.floor(br.minY)} bis ${Math.floor(br.maxY)})\n`;
   });
 
-  stats += `\nSchnittbereiche (Keep Regions):\n`;
+  stats += `\nKeep-Segmente (Schnittbereiche):\n`;
   stats += keepRegionsStats;
 
   return { debugImage, stats, croppedStrips };

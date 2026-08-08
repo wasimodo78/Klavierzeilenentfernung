@@ -1,8 +1,9 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { jsPDF } from 'jspdf';
+import workerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url';
 
-// Set the worker source to the CDN to avoid Vite bundling issues with web workers
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+// Bundle the pdf.js worker locally so the app works fully offline (no CDN needed).
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
 type Region = { start: number; end: number; type: 'ink' | 'gap' };
 
@@ -338,7 +339,9 @@ export async function generatePdf(
       pageCount++;
     }
 
-    outPdf.addImage(img.dataUrl, 'JPEG', margin, currentY, contentWidth, scaledHeight, undefined, 'FAST');
+    // Format aus der Data-URL erkennen (1-Bit Ausgabe kommt als PNG)
+    const imgFormat = img.dataUrl.startsWith('data:image/png') ? 'PNG' : 'JPEG';
+    outPdf.addImage(img.dataUrl, imgFormat, margin, currentY, contentWidth, scaledHeight, undefined, 'FAST');
     currentY += scaledHeight + gap; 
   }
 

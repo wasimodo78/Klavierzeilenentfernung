@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useMemo } from 'react';
 import { UploadCloud, Loader2, Download, Eye, ArrowLeft, Layout, List } from 'lucide-react';
-import { extractSystems, generatePdf, ExtractedSystem, groupSystemsIntoPages } from './utils/pdfProcessor';
+import { generatePdf, ExtractedSystem, groupSystemsIntoPages } from './utils/pdfProcessor';
 import { analyzePdfVectors } from './utils/vectorAnalyzer';
 import { analyzePixels } from './utils/cvAnalyzer';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -15,6 +15,9 @@ export default function App() {
   const [debugOutputs, setDebugOutputs] = useState<string[]>([]);
   const [cvDebugImages, setCvDebugImages] = useState<string[]>([]);
   const [cvCroppedImages, setCvCroppedImages] = useState<string[]>([]);
+  const [mainDebug, setMainDebug] = useState<{ image: string, stats: string }[]>([]);
+  const [download, setDownload] = useState<{ url: string, name: string } | null>(null);
+  const [outputMode, setOutputMode] = useState<'sb600' | 'sb300' | 'foto300'>('sb600');
   
   const [currentFile, setCurrentFile] = useState<File | null>(null);
   const [viewMode, setViewMode] = useState<'systems' | 'pages'>('pages');
@@ -36,15 +39,61 @@ export default function App() {
     setDebugOutputs([]);
     setCvDebugImages([]);
     setCvCroppedImages([]);
+    setMainDebug([]);
+    setDownload(null);
     setProgressMsg('Analysiere PDF...');
     setProgressPct(0);
 
     try {
-      const images = await extractSystems(file, (msg, pct) => {
-        setProgressMsg(msg);
-        setProgressPct(pct);
-      });
-      setPreviewImages(images);
+      // Haupt-Workflow: CV-basierte Erkennung (Notenlinien, Akkoladen, Klammern)
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const numPages = pdf.numPages;
+
+      const allStrips: ExtractedSystem[] = [];
+      const allDebug: { image: string, stats: string }[] = [];
+
+      for (let i = 1; i <= numPages; i++) {
+        setProgressMsg(`Analysiere Seite ${i} von ${numPages}...`);
+        setProgressPct(10 + (i / numPages) * 85);
+
+        const page = await pdf.getPage(i);
+
+        // 300-dpi-Analyse-Render (2480px), identisch zum validierten CV-Inspektor
+        const unscaledViewport = page.getViewport({ scale: 1.0 });
+        const scale = 2480 / unscaledViewport.width;
+        const viewport = page.getViewport({ scale });
+        const canvas = document.createElement('canvas');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext('2d')!;
+
+        await page.render({ canvasContext: ctx, viewport }).promise;
+
+        // Zusätzlicher hochauflösender Render nur für die Ausgabe (600-dpi-Modus)
+        let outCanvas: HTMLCanvasElement | null = null;
+        if (outputMode === 'sb600') {
+          setProgressMsg(`Seite ${i}: Rendere hochauflösend...`);
+          const hiViewport = page.getViewport({ scale: scale * 2 });
+          outCanvas = document.createElement('canvas');
+          outCanvas.width = hiViewport.width;
+          outCanvas.height = hiViewport.height;
+          const hiCtx = outCanvas.getContext('2d')!;
+          await page.render({ canvasContext: hiCtx, viewport: hiViewport }).promise;
+        }
+
+        const { croppedStrips, debugImage, stats } = await analyzePixels(canvas, (msg) => {
+          setProgressMsg(`Seite ${i}: ${msg}`);
+        }, i, { canvas: outCanvas ?? canvas, bilevel: outputMode !== 'foto300' });
+
+        allStrips.push(...croppedStrips.map(s => ({ dataUrl: s.dataUrl, width: s.width, height: s.height })));
+        allDebug.push({ image: debugImage, stats });
+      }
+
+      setProgressMsg('Fertig analysiert!');
+      setProgressPct(100);
+      setPreviewImages(allStrips);
+      setMainDebug(allDebug);
     } catch (error) {
       console.error(error);
       alert('Es gab einen Fehler bei der Verarbeitung der Datei.');
@@ -67,9 +116,17 @@ export default function App() {
       });
 
       const url = URL.createObjectURL(resultBlob);
+      const name = currentFile.name.replace('.pdf', '_geschnitten.pdf');
+      setDownload(prev => {
+        if (prev) URL.revokeObjectURL(prev.url);
+        return { url, name };
+      });
+
+      // Automatischen Download versuchen (wird in Sandbox-iframes ggf. blockiert –
+      // der sichtbare Link unter der Vorschau ist der zuverlässige Weg)
       const a = document.createElement('a');
       a.href = url;
-      a.download = currentFile.name.replace('.pdf', '_geschnitten.pdf');
+      a.download = name;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -104,6 +161,8 @@ export default function App() {
       setDebugOutputs([]);
       setCvDebugImages([]);
       setCvCroppedImages([]);
+    setMainDebug([]);
+    setDownload(null);
       
       try {
         const output = await analyzePdfVectors(file, (msg) => {
@@ -129,6 +188,8 @@ export default function App() {
       setDebugOutputs([]);
       setCvDebugImages([]);
       setCvCroppedImages([]);
+    setMainDebug([]);
+    setDownload(null);
       
       try {
         setProgressMsg('Lade PDF...');
@@ -228,13 +289,15 @@ export default function App() {
         <div className="bg-indigo-600 px-8 py-8 text-center relative">
           {(previewImages || debugOutputs.length > 0 || cvDebugImages.length > 0 || cvCroppedImages.length > 0) && !isProcessing && (
             <button 
-              onClick={() => { setPreviewImages(null); setDebugOutputs([]); setCvDebugImages([]); setCvCroppedImages([]); setCurrentFile(null); }}
+              onClick={() => { setPreviewImages(null); setDebugOutputs([]); setCvDebugImages([]); setCvCroppedImages([]);
+    setMainDebug([]);
+    setDownload(null); setCurrentFile(null); }}
               className="absolute left-6 top-8 text-indigo-100 hover:text-white transition-colors flex items-center gap-1 text-sm font-medium"
             >
               <ArrowLeft className="w-4 h-4" /> Neue Datei
             </button>
           )}
-          <h1 className="text-3xl font-bold text-white mb-2">Noten Extraktor <span className="text-xl font-normal text-indigo-200">v10</span></h1>
+          <h1 className="text-3xl font-bold text-white mb-2">Noten Extraktor <span className="text-xl font-normal text-indigo-200">v12</span></h1>
           <p className="text-indigo-100 text-sm max-w-lg mx-auto">
             Lade deine Partitur als PDF hoch. Die App schneidet automatisch die Klavierbegleitung weg. 
             Überprüfe das Ergebnis im Preview und lade das neue PDF herunter.
@@ -261,8 +324,22 @@ export default function App() {
                   onChange={onFileSelect}
                 />
                 <UploadCloud className="w-16 h-16 text-indigo-400 mx-auto mb-4" />
-                <h3 className="text-xl font-semibold text-slate-700 mb-2">PDF zuschneiden (Pixel-Modus)</h3>
-                <p className="text-slate-500">PDF hier ablegen oder klicken</p>
+                <h3 className="text-xl font-semibold text-slate-700 mb-2">PDF zuschneiden</h3>
+                <p className="text-slate-500">Klavierzeilen entfernen &amp; Chor neu anordnen — PDF hier ablegen oder klicken</p>
+              </div>
+
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 bg-slate-50 border border-slate-200 rounded-xl px-4 py-3">
+                <label htmlFor="output-quality" className="text-sm font-medium text-slate-700">Ausgabequalität:</label>
+                <select
+                  id="output-quality"
+                  value={outputMode}
+                  onChange={(e) => setOutputMode(e.target.value as 'sb600' | 'sb300' | 'foto300')}
+                  className="w-full sm:w-auto text-sm rounded-lg border-slate-300 px-3 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="sb600">Schwarz-Weiß 600 dpi (empfohlen: Druck &amp; Vektor-PDFs)</option>
+                  <option value="sb300">Schwarz-Weiß 300 dpi (kleinere Datei)</option>
+                  <option value="foto300">Foto/Farbe JPEG 300 dpi (für Graustufen-Scans)</option>
+                </select>
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -390,6 +467,32 @@ export default function App() {
                 </div>
               </div>
 
+              {download && (
+                <div className="mb-6 bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-3">
+                  <p className="text-emerald-800 text-sm font-medium">
+                    Das PDF wurde erstellt. Falls der Download nicht automatisch gestartet ist:
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <a
+                      href={download.url}
+                      download={download.name}
+                      className="inline-flex items-center gap-2 px-6 py-2.5 bg-emerald-600 text-white rounded-lg font-medium hover:bg-emerald-700 transition-colors shadow-sm whitespace-nowrap"
+                    >
+                      <Download className="w-4 h-4" />
+                      {download.name} speichern
+                    </a>
+                    <a
+                      href={download.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-2 px-4 py-2.5 bg-white text-emerald-700 border border-emerald-300 rounded-lg font-medium hover:bg-emerald-100 transition-colors whitespace-nowrap"
+                    >
+                      Im neuen Tab öffnen
+                    </a>
+                  </div>
+                </div>
+              )}
+
               <div className="bg-slate-100 p-6 rounded-xl border border-slate-200 overflow-y-auto max-h-[70vh] shadow-inner">
                 {previewImages.length === 0 ? (
                   <div className="text-center py-10 text-slate-500">
@@ -432,6 +535,30 @@ export default function App() {
                   </div>
                 )}
               </div>
+
+              {/* Diagnose pro Seite: Erkennungsdetails des Haupt-Workflows (für Feedbackschlaufen) */}
+              {mainDebug.length > 0 && (
+                <div className="mt-8">
+                  <h4 className="text-lg font-semibold text-slate-800 mb-3">Diagnose: Was die Erkennung gesehen hat</h4>
+                  <div className="space-y-3">
+                    {mainDebug.map((d, idx) => (
+                      <details key={idx} className="bg-white border border-slate-200 rounded-lg overflow-hidden group">
+                        <summary className="cursor-pointer px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 select-none">
+                          Seite {idx + 1} — Akkoladen, Klammern &amp; Schnittbereiche
+                        </summary>
+                        <div className="p-4 border-t border-slate-100 grid gap-4 md:grid-cols-2">
+                          <img src={d.image} alt={`Diagnose Seite ${idx + 1}`} className="w-full h-auto object-contain border border-slate-100 rounded" />
+                          <textarea
+                            className="w-full h-64 bg-slate-900 text-emerald-400 font-mono text-xs rounded-lg p-3 focus:outline-none resize-none"
+                            readOnly
+                            value={d.stats}
+                          />
+                        </div>
+                      </details>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
