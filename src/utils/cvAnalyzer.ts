@@ -480,6 +480,7 @@ export async function analyzePixels(
     const BOTTOM_GATE = 0.7;              // untere 30% der Seite: kein neuer Titel
     const COPYRIGHT_MIN_W_FRAC = 0.35;    // breite, flache Zeile = Copyright
     const ZONE_MIN_W_FRAC = 0.22;         // Titelzone: mind. eine Zeile so breit (% Seitenbreite)
+    const DETACH_SP = 1.8;                // Titel haengt nie am Satz: echter Abstand noetig
     const findMergedClusters = (yFrom: number, yTo: number): ContentCluster[] => {
       const maxGap = globalAvgSpatium * MERGE_GAP_SP;
       const fine = findContentClusters(yFrom, yTo);
@@ -498,28 +499,39 @@ export async function analyzePixels(
     };
 
     // Hilfsregeln für Titel-/Copyright-Erkennung (Geometrie, kein OCR)
-    const clusterWidth = (cl: ContentCluster): number => {
-      let cx0 = width, cx1 = -1;
+    // Breiten-Metrik eines Clusters: entscheidend ist die breiteste EINZELNE Zeile
+    // (maxSpan). Eine Union über Zeilen würde Kaestchen+nebeneinanderstehende
+    // Dynamik faelschlich als breit werten (16-Box | mf).
+    const clusterMetrics = (cl: ContentCluster): { width: number; maxSpan: number } => {
+      let cx0 = width, cx1 = -1, maxSpan = 0;
       for (let y = Math.max(0, cl.start); y <= Math.min(height - 1, cl.end); y++) {
         const rowOff = y * width;
+        let rowMin = width, rowMax = -1;
         for (let x = 0; x < width; x++) {
           if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
-            if (x < cx0) cx0 = x;
-            if (x > cx1) cx1 = x;
+            if (x < rowMin) rowMin = x;
+            if (x > rowMax) rowMax = x;
           }
         }
+        if (rowMax >= rowMin) {
+          if (rowMin < cx0) cx0 = rowMin;
+          if (rowMax > cx1) cx1 = rowMax;
+          const span = rowMax - rowMin + 1;
+          if (span > maxSpan) maxSpan = span;
+        }
       }
-      return cx1 >= cx0 ? (cx1 - cx0 + 1) : 0;
+      return { width: cx1 >= cx0 ? (cx1 - cx0 + 1) : 0, maxSpan };
     };
+    const clusterWidth = (cl: ContentCluster): number => clusterMetrics(cl).width;
 
     const isDisplayTitle = (cl: ContentCluster) =>
       cl.size >= globalAvgSpatium * DISPLAY_BLOCK_SP && cl.maxLine >= globalAvgSpatium * DISPLAY_LINE_SP &&
-      clusterWidth(cl) >= globalAvgSpatium * 8; // breit! Uebungszeichen-Kaestchen sind schmal (~3-5 Spatia)
+      clusterMetrics(cl).maxSpan >= width * 0.05; // breiteste EINZELNE Zeile: Titelzeilen sind breit, Kaestchen schmal
 
     // Eine echte Titelzone hat irgendeine breite Zeile (Titel/Untertitel/Absatz);
     // Kästchen+Dynamik-Paeckchen im Graben sind nur 2-5% breit.
     const hasWideLine = (clusters: ContentCluster[]) =>
-      clusters.some(cl => clusterWidth(cl) >= width * ZONE_MIN_W_FRAC);
+      clusters.some(cl => clusterMetrics(cl).maxSpan >= width * ZONE_MIN_W_FRAC);
 
     const isWideShallowLine = (cl: ContentCluster, maxHsp: number, staffSpanX: number) =>
       cl.start >= height * BOTTOM_GATE &&
@@ -570,11 +582,17 @@ export async function analyzePixels(
           // Kopfbereich: reine Textzone ohne Notenlinien. Ab ~20 Spatia Höhe
           // (Titelvorspann) ODER Fettdruck-Block dabei -> neuer Stückbeginn.
           // Nie in den unteren 30% (dort steht Copyright, kein Titel).
+          // Fenster endet 1 Spatium ueber dem System (Notenlinien haben 2-4px
+          // Dicke) und der Block muss vom System ABGELÖST stehen (sonst ist es
+          // Satz: Übungszeichen, Dynamik, Bogen, Seitenzahl in einer Zeile).
           const scanFrom = Math.max(0, Math.floor(firstStaff.y1 - globalAvgSpatium * 50));
-          const headClusters = findMergedClusters(scanFrom, firstStaff.y1 - 1);
-          const headStart = headClusters.length > 0 ? headClusters[0].start : 0;
-          const headSpan = headClusters.length > 0 ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
-          const sumH = headClusters.reduce((s, cl) => s + cl.size, 0);
+          const scanTo = Math.floor(firstStaff.y1 - Math.ceil(globalAvgSpatium));
+          const headClusters = findMergedClusters(scanFrom, scanTo);
+          const detachedBelow = headClusters.length === 0 ||
+            headClusters[headClusters.length - 1].end <= firstStaff.y1 - globalAvgSpatium * DETACH_SP;
+          const headStart = headClusters.length > 0 && detachedBelow ? headClusters[0].start : 0;
+          const headSpan = headClusters.length > 0 && detachedBelow ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
+          const sumH = detachedBelow ? headClusters.reduce((s, cl) => s + cl.size, 0) : 0;
           const coverage = headSpan > 0 ? sumH / headSpan : 0;
           // Dicht gepackte Textzone (viel Text auf engem Raum) = Titelvorspann;
           // vereinzelte Kopf-/Tempozeilen mit grossen Abständen dagegen nicht
@@ -583,6 +601,7 @@ export async function analyzePixels(
           if (isPieceHead) {
             newPiece = true;
             segTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
+            keepRegionsStats += `  [TITEL-Kopf? start=${headStart} span=${headSpan.toFixed(0)} sumH=${sumH.toFixed(0)} cov=${coverage.toFixed(2)}]\n`;
           } else {
             segTop = Math.max(0, Math.floor(firstStaff.y1 - topMargin));
           }
@@ -590,19 +609,24 @@ export async function analyzePixels(
       } else {
         // Titelerkennung im Graben: hohe reine Textzone (~15+ Spatia) ODER
         // Fettdruck-Block = neuer Titel. Nie in den unteren 30% der Seite.
-        const gapClusters = findMergedClusters(prevStaff.y5 + 1, firstStaff.y1 - 1);
+        // Fenster beginnt 1 Spatium unter dem Klavier (Liniendicke) und ein
+        // Kandidat muss vom Klavier ABGELÖST stehen – sonst ist es Musik
+        // (Haltebögen, tiefe Bassnoten, Kästchen-Kette darunter).
+        const gapClusters = findMergedClusters(prevStaff.y5 + Math.ceil(globalAvgSpatium), firstStaff.y1 - 1);
         const gapStart = gapClusters.length > 0 ? gapClusters[0].start : 0;
         const gapSpan = gapClusters.length > 0 ? gapClusters[gapClusters.length - 1].end - gapStart + 1 : 0;
         const gatedByPosition = gapClusters.length > 0 && gapStart < height * BOTTOM_GATE;
-        const sumH = gapClusters.reduce((s, cl) => s + cl.size, 0);
+        const detachedAbove = gapClusters.length > 0 && gapStart - prevStaff.y5 >= globalAvgSpatium * DETACH_SP;
+        const sumH = detachedAbove ? gapClusters.reduce((s, cl) => s + cl.size, 0) : 0;
         const coverage = gapSpan > 0 ? sumH / gapSpan : 0;
-        const zoneTitle = gatedByPosition && gapClusters.length > 0 && sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(gapClusters);
-        const displayCluster = gatedByPosition ? gapClusters.find(isDisplayTitle) : undefined;
+        const zoneTitle = gatedByPosition && detachedAbove && gapClusters.length > 0 && sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(gapClusters);
+        const displayCluster = gatedByPosition && detachedAbove ? gapClusters.find(isDisplayTitle) : undefined;
         const titleStart = zoneTitle ? gapStart : (displayCluster ? displayCluster.start : null);
 
         if (pageIndex > 1 && titleStart !== null) {
           newPiece = true;
           segTop = Math.max(Math.floor(prevStaff.y5 + globalAvgSpatium), Math.floor(titleStart - globalAvgSpatium));
+          keepRegionsStats += `  [TITEL-Graben? start=${titleStart} span=${gapSpan.toFixed(0)} sumH=${sumH.toFixed(0)} cov=${coverage.toFixed(2)} detach=${detachedAbove}]\n`;
         } else {
         // Schnitt in die LETZTE große Lücke vor dem Vokal-System (die Luft direkt
         // darüber): Alles, was am Klavier klebt – tiefe Basstöne mit Hilfslinien,
@@ -659,10 +683,12 @@ export async function analyzePixels(
     // ein grosser Titelblock (ab Seite 2 -> neues Stück im Heft), wird er als
     // eigener Streifen davor ausgegeben. Titel bleibt, Klavier-Intro bleibt weg.
     if (pageIndex > 1 && staves.length > 0 && isPiano[0] && segments.length > 0) {
-      const headClusters = findMergedClusters(0, staves[0].y1 - 1);
-      const headStart = headClusters.length > 0 ? headClusters[0].start : 0;
-      const headSpan = headClusters.length > 0 ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
-      const sumH = headClusters.reduce((s, cl) => s + cl.size, 0);
+      const headClusters = findMergedClusters(0, Math.floor(staves[0].y1 - Math.ceil(globalAvgSpatium)));
+      const detachedBelow = headClusters.length === 0 ||
+        headClusters[headClusters.length - 1].end <= staves[0].y1 - globalAvgSpatium * DETACH_SP;
+      const headStart = headClusters.length > 0 && detachedBelow ? headClusters[0].start : 0;
+      const headSpan = headClusters.length > 0 && detachedBelow ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
+      const sumH = detachedBelow ? headClusters.reduce((s, cl) => s + cl.size, 0) : 0;
       const coverage = headSpan > 0 ? sumH / headSpan : 0;
       const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
         ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters)) || headClusters.some(isDisplayTitle));
