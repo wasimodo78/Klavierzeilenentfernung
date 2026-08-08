@@ -3,6 +3,9 @@ import { UploadCloud, Loader2, Download, Eye, ArrowLeft, Layout, List } from 'lu
 import { generatePdf, ExtractedSystem, groupSystemsIntoPages, layoutSize, PAGE_LAYOUT } from './utils/pdfProcessor';
 
 const CONTENT_WIDTH_MM = PAGE_LAYOUT.A4_WIDTH_MM - 2 * PAGE_LAYOUT.MARGIN_MM;
+// Läuft die App eingebettet (Arena-Vorschau-iframe), blockiert der Browser
+// Downloads und Speicher-Dialoge – dann helles Info-Band anzeigen.
+const IS_FRAMED = typeof window !== 'undefined' && window.self !== window.top;
 import { analyzePdfVectors } from './utils/vectorAnalyzer';
 import { analyzePixels } from './utils/cvAnalyzer';
 import * as pdfjsLib from 'pdfjs-dist';
@@ -20,6 +23,8 @@ export default function App() {
   const [mainDebug, setMainDebug] = useState<{ image: string, stats: string }[]>([]);
   const [download, setDownload] = useState<{ url: string, name: string } | null>(null);
   const [outputMode, setOutputMode] = useState<'sb600' | 'sb300' | 'foto300'>('sb600');
+  const [serverUrl, setServerUrl] = useState<string | null>(null);
+  const [pickerBlocked, setPickerBlocked] = useState<string | null>(null);
   
   const [currentFile, setCurrentFile] = useState<File | null>(null);
   const [viewMode, setViewMode] = useState<'systems' | 'pages'>('pages');
@@ -43,6 +48,8 @@ export default function App() {
     setCvCroppedImages([]);
     setMainDebug([]);
     setDownload(null);
+    setServerUrl(null);
+    setPickerBlocked(null);
     setProgressMsg('Analysiere PDF...');
     setProgressPct(0);
 
@@ -73,9 +80,14 @@ export default function App() {
 
         await page.render({ canvasContext: ctx, viewport }).promise;
 
-        // Zusätzlicher hochauflösender Render nur für die Ausgabe (600-dpi-Modus)
+        // Zusätzlicher hochauflösender Render nur für die Ausgabe (600-dpi-Modus).
+        // Bei sehr großen Dateien automatisch 300 dpi (Speicherschutz).
+        const hiCap = outputMode === 'sb600' && numPages <= 60;
+        if (outputMode === 'sb600' && !hiCap && i === 1) {
+          setProgressMsg(`Hinweis: Große Datei (${numPages} Seiten) – Ausgabe automatisch in 300 dpi (Speicherschutz)`);
+        }
         let outCanvas: HTMLCanvasElement | null = null;
-        if (outputMode === 'sb600') {
+        if (hiCap) {
           setProgressMsg(`Seite ${i}: Rendere hochauflösend...`);
           const hiViewport = page.getViewport({ scale: scale * 2 });
           outCanvas = document.createElement('canvas');
@@ -91,6 +103,11 @@ export default function App() {
 
         allStrips.push(...croppedStrips.map(s => ({ dataUrl: s.dataUrl, width: s.width, height: s.height, widthMm: s.widthMm, heightMm: s.heightMm })));
         allDebug.push({ image: debugImage, stats });
+
+        // Raster-Speicher der Seiten-Canvases sofort freigeben (kritisch bei vielen Seiten)
+        page.cleanup();
+        canvas.width = 0; canvas.height = 0;
+        if (outCanvas) { outCanvas.width = 0; outCanvas.height = 0; }
       }
 
       setProgressMsg('Fertig analysiert!');
@@ -107,6 +124,46 @@ export default function App() {
 
   const handleDownload = async () => {
     if (!previewImages || !currentFile) return;
+
+    const fileName = currentFile.name.replace('.pdf', '_geschnitten.pdf');
+
+    // Bevorzugt: File System Access API. Der native Speichern-Dialog wird synchron
+    // zur Klick-Geste geöffnet (Zielordner wählbar, i. d. R. Downloads) und das PDF
+    // anschließend direkt dorthin geschrieben – funktioniert auch in der Sandbox-
+    // Vorschau, wo blockierte Auto-Downloads scheitern. Nicht verfügbar/abgelehnt
+    // -> Fallback auf den klassischen Weg (Banner-Link) weiter unten.
+    const picker = (window as unknown as {
+      showSaveFilePicker?: (opts: {
+        suggestedName: string;
+        types: { description: string; accept: Record<string, string[]> }[];
+      }) => Promise<{ createWritable: () => Promise<{ write: (b: Blob) => Promise<void>; close: () => Promise<void> }> }>;
+    }).showSaveFilePicker;
+
+    if (picker) {
+      try {
+        const handle = await picker({
+          suggestedName: fileName,
+          types: [{ description: 'PDF-Dokument', accept: { 'application/pdf': ['.pdf'] } }],
+        });
+        setIsProcessing(true);
+        setProgressMsg('Erstelle PDF...');
+        setProgressPct(0);
+        const resultBlob = await generatePdf(previewImages, (msg, pct) => {
+          setProgressMsg(msg);
+          setProgressPct(pct);
+        });
+        const writable = await handle.createWritable();
+        await writable.write(resultBlob);
+        await writable.close();
+        return;
+      } catch (err) {
+        if ((err as DOMException)?.name === 'AbortError') return; // Dialog abgebrochen
+        console.warn('Datei-Dialog nicht verfügbar, klassischer Download-Weg:', err);
+        setPickerBlocked((err as Error)?.name ?? 'unbekannt');
+      } finally {
+        setIsProcessing(false);
+      }
+    }
 
     setIsProcessing(true);
     setProgressMsg('Erstelle PDF...');
@@ -133,6 +190,15 @@ export default function App() {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
+
+      // Zusätzlich am Dev-Server ablegen: Direkt-Download mit Attachment-Header
+      // (neuer Tab speichert dann automatisch ins Download-Verzeichnis)
+      try {
+        const resp = await fetch(`/api/export?name=${encodeURIComponent(name)}`, { method: 'POST', body: resultBlob });
+        if (resp.ok) setServerUrl(`/api/export.pdf?t=${Date.now()}`);
+      } catch {
+        // statisches Hosting ohne Dev-Server – ignorieren
+      }
     } catch (error) {
       console.error(error);
       alert('Fehler beim PDF-Export.');
@@ -166,6 +232,8 @@ export default function App() {
       setCvCroppedImages([]);
     setMainDebug([]);
     setDownload(null);
+    setServerUrl(null);
+    setPickerBlocked(null);
       
       try {
         const output = await analyzePdfVectors(file, (msg) => {
@@ -193,6 +261,8 @@ export default function App() {
       setCvCroppedImages([]);
     setMainDebug([]);
     setDownload(null);
+    setServerUrl(null);
+    setPickerBlocked(null);
       
       try {
         setProgressMsg('Lade PDF...');
@@ -294,7 +364,9 @@ export default function App() {
             <button 
               onClick={() => { setPreviewImages(null); setDebugOutputs([]); setCvDebugImages([]); setCvCroppedImages([]);
     setMainDebug([]);
-    setDownload(null); setCurrentFile(null); }}
+    setDownload(null);
+    setServerUrl(null);
+    setPickerBlocked(null); setCurrentFile(null); }}
               className="absolute left-6 top-8 text-indigo-100 hover:text-white transition-colors flex items-center gap-1 text-sm font-medium"
             >
               <ArrowLeft className="w-4 h-4" /> Neue Datei
@@ -306,6 +378,16 @@ export default function App() {
             Überprüfe das Ergebnis im Preview und lade das neue PDF herunter.
           </p>
         </div>
+
+        {IS_FRAMED && (
+          <div className="bg-amber-50 border-b border-amber-200 px-6 py-2 text-center text-xs text-amber-800">
+            Eingebettete Vorschau: Wenn Downloads blockiert werden,{' '}
+            <a href={window.location.href} target="_blank" rel="noopener" className="underline font-semibold">
+              App in eigenem Tab öffnen
+            </a>{' '}
+            – dort funktioniert der Auto-Download ins Download-Verzeichnis.
+          </div>
+        )}
 
         {/* Main Content */}
         <div className="p-8">
@@ -472,9 +554,12 @@ export default function App() {
 
               {download && (
                 <div className="mb-6 bg-emerald-50 border border-emerald-200 rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-3">
-                  <p className="text-emerald-800 text-sm font-medium">
-                    Das PDF wurde erstellt. Falls der Download nicht automatisch gestartet ist:
-                  </p>
+                  <div className="text-emerald-800 text-sm font-medium">
+                    <p>Das PDF wurde erstellt. Falls der Download nicht automatisch gestartet ist:</p>
+                    {pickerBlocked && (
+                      <p className="text-xs opacity-70 mt-0.5">Direkt-Speichern vom System blockiert ({pickerBlocked}).</p>
+                    )}
+                  </div>
                   <div className="flex items-center gap-2">
                     <a
                       href={download.url}
@@ -492,6 +577,18 @@ export default function App() {
                     >
                       Im neuen Tab öffnen
                     </a>
+                    {serverUrl && (
+                      <a
+                        href={serverUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        title="Öffnet einen neuen Tab – die Datei wird automatisch ins Download-Verzeichnis gespeichert"
+                        className="inline-flex items-center gap-2 px-4 py-2.5 bg-white text-indigo-700 border border-indigo-300 rounded-lg font-medium hover:bg-indigo-100 transition-colors whitespace-nowrap"
+                      >
+                        <Download className="w-4 h-4" />
+                        Direkt-Download
+                      </a>
+                    )}
                   </div>
                 </div>
               )}

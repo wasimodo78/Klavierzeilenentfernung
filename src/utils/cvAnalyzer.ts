@@ -659,7 +659,21 @@ export async function analyzePixels(
 
   ctx.putImageData(imgData, 0, 0);
 
-  const debugImage = canvas.toDataURL('image/jpeg', 0.8);
+  // Debug-Bild zur Speicherschonung auf max. 1240px Breite verkleinern
+  // (bei vielen Seiten summieren sich die Daten-URLs sonst massiv)
+  const dbgScale = Math.min(1, 1240 / width);
+  let debugImage: string;
+  if (dbgScale < 1) {
+    const dbgCanvas = document.createElement('canvas');
+    dbgCanvas.width = Math.floor(width * dbgScale);
+    dbgCanvas.height = Math.floor(height * dbgScale);
+    const dbgCtx = dbgCanvas.getContext('2d')!;
+    dbgCtx.drawImage(canvas, 0, 0, dbgCanvas.width, dbgCanvas.height);
+    debugImage = dbgCanvas.toDataURL('image/jpeg', 0.8);
+    dbgCanvas.width = 0; dbgCanvas.height = 0;
+  } else {
+    debugImage = canvas.toDataURL('image/jpeg', 0.8);
+  }
   
   let stats = `Bildgröße: ${width}x${height}
 Schwarze Pixel: ${blackPixelCount}
