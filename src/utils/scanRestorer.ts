@@ -1224,7 +1224,14 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
   debug.stageImages.push({ label: `Ausgerichtet (${o.rotate90 ? '90°+' : ''}${fa.angleDeg.toFixed(2)}°)`, dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
 
   // 3. Geometrie: Prediktiv-Spur-Gitter (Innen nach aussen) zuerst; Kontur-Fallback.
-  const trackGrid = estimateTrackGrid(work);
+  let trackGrid = estimateTrackGrid(work);
+  if (trackGrid.staves.length < 4 || trackGrid.coverage < 0.4) {
+    const polyGrid = estimatePolynomialStaffGrid(work);
+    if (polyGrid.staves.length > trackGrid.staves.length || polyGrid.coverage > trackGrid.coverage) {
+      debug.splitEvidence += `[Pixel-Tracker ersetzt durch Polynom-Linien: ${trackGrid.reason || `${trackGrid.staves.length} Staffeln`} -> ${polyGrid.staves.length} Staffeln] `;
+      trackGrid = polyGrid;
+    }
+  }
   // Spur-Entwölbung nur verwenden, wenn wirklich ein nennenswertes Seiten-Gitter
   // erkannt wurde. 1-2 zufällig getrackte Staffeln würden sonst die ganze Seite
   // auf wenige Notenzeilen zusammendrücken (bei Handyfotos katastrophal).
@@ -1283,7 +1290,14 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
   // Danach erneut Staff-Linien suchen: hier sind die Linien wesentlich stabiler
   // als im rohen Handyfoto. Nur wenn genug Staffeln gefunden wurden, lokal und
   // layout-erhaltend entwölben.
-  const postGrid = estimateTrackGrid(work);
+  let postGrid = estimateTrackGrid(work);
+  if (postGrid.staves.length < 4 || postGrid.coverage < 0.35) {
+    const polyPost = estimatePolynomialStaffGrid(work);
+    if (polyPost.staves.length > postGrid.staves.length || polyPost.coverage > postGrid.coverage) {
+      debug.splitEvidence += `[Post-Polynom-Linien: ${postGrid.reason || `${postGrid.staves.length} Staffeln`} -> ${polyPost.staves.length} Staffeln] `;
+      postGrid = polyPost;
+    }
+  }
   if (postGrid.coverage >= 0.35 && postGrid.staves.length >= 4) {
     debug.stageImages.push({ label: `Post-Gitter (${postGrid.staves.length} Staffeln, Spatium ${postGrid.spatiumPx.toFixed(1)}px)`, dataUrl: postGrid.overlay ? postGrid.overlay.toDataURL('image/jpeg', 0.75) : '' });
     const straight = straightenStaffBands(work, postGrid);
@@ -1729,6 +1743,234 @@ export function estimateTrackGrid(canvas: HTMLCanvasElement): GridResult {
     octx.beginPath();
     octx.moveTo(t.startX, t.evalAt(t.startX));
     for (let x = t.startX; x <= t.endX; x += 8) octx.lineTo(x, t.evalAt(x));
+    octx.stroke();
+  }
+  return { staves, spatiumPx, coverage, overlay };
+}
+
+
+function trajectoryFromPolynomialPts(ptsIn: TrackPt[], w: number): Trajectory | null {
+  const pts = ptsIn.slice().sort((a, b) => a.x - b.x);
+  if (pts.length < 6) return null;
+  const fit = chebFit(pts);
+  let sq = 0;
+  for (const p of pts) sq += (p.y - fit.evalAt(p.x)) ** 2;
+  const residRms = Math.sqrt(sq / pts.length);
+  const evalAtSafe = (x: number) => {
+    if (x < pts[0].x) return pts[0].y + (x - pts[0].x) * edgeSlope(pts, 'start');
+    if (x > pts[pts.length - 1].x) return pts[pts.length - 1].y + (x - pts[pts.length - 1].x) * edgeSlope(pts, 'end');
+    return fit.evalAt(x);
+  };
+  return { pts, startX: pts[0].x, endX: pts[pts.length - 1].x, fitDeg: fit.deg, residRms, evalAt: fit.evalAt, evalAtSafe };
+}
+
+/**
+ * Stafflinien-Erkennung als Polynomfamilien über vertikale Streifen.
+ *
+ * Die pixelgenaue Tracker-Variante kann bei Fotos scheitern, wenn Linien durch
+ * Perspektive, Druckraster oder Noten überdeckt sind. Diese Variante misst in
+ * vielen schmalen X-Streifen die horizontalen Projektionsspitzen, verknüpft
+ * diese Peaks zu Kurven und fitet daraus Polynome. Das ist genau die Struktur,
+ * die wir später fürs Keystoning/Entwölben brauchen.
+ */
+export function estimatePolynomialStaffGrid(canvas: HTMLCanvasElement): GridResult {
+  const small = downscale(canvas, 1300, true);
+  const w = small.width, h = small.height;
+  const bin = closeH(binarizeAdaptive(small, 0.05, 0.66), w, h, 3);
+  const analysisX0 = Math.floor(w * 0.12);
+  const analysisX1 = w - 1;
+  const analysisW = analysisX1 - analysisX0 + 1;
+  const stripCount = Math.max(18, Math.min(48, Math.round(analysisW / 34)));
+  const stripW = analysisW / stripCount;
+
+  type Cand = { strip: number; x: number; y: number; score: number; used?: boolean };
+  const byStrip: Cand[][] = [];
+  const seedLike: { x: number; y: number }[] = [];
+
+  for (let s = 0; s < stripCount; s++) {
+    const x0 = analysisX0 + Math.floor(s * stripW);
+    const x1 = Math.min(analysisX1, Math.max(x0, analysisX0 + Math.floor((s + 1) * stripW) - 1));
+    const sw = x1 - x0 + 1;
+    const prof = new Float64Array(h);
+    for (let y = 0; y < h; y++) {
+      let c = 0;
+      const off = y * w;
+      for (let x = x0; x <= x1; x++) if (bin[off + x]) c++;
+      prof[y] = c;
+    }
+    const smoothP = new Float64Array(h);
+    for (let y = 0; y < h; y++) {
+      let sm = 0, n = 0;
+      for (let k = -1; k <= 1; k++) {
+        const yy = y + k;
+        if (yy >= 0 && yy < h) { sm += prof[yy]; n++; }
+      }
+      smoothP[y] = sm / Math.max(1, n);
+    }
+    const vals = Array.from(smoothP).sort((a, b) => a - b);
+    const q88 = vals[Math.floor(vals.length * 0.88)] ?? 0;
+    // Streifen sind schmal; eine echte Stafflinie kann dort nur wenige dunkle
+    // Pixel breit sein. Schwelle deshalb bewusst niedrig, nachher filtern
+    // Tracking/5er-Gruppierung die Text- und Rauschpeaks heraus.
+    const threshold = Math.max(1.1, sw * 0.032, q88 * 0.72);
+    const cands: Cand[] = [];
+    let y = 1;
+    while (y < h - 1) {
+      if (smoothP[y] >= threshold && smoothP[y] >= smoothP[y - 1] && smoothP[y] >= smoothP[y + 1]) {
+        let y0 = y, y1 = y;
+        while (y0 > 0 && smoothP[y0 - 1] >= threshold * 0.72) y0--;
+        while (y1 < h - 1 && smoothP[y1 + 1] >= threshold * 0.72) y1++;
+        let sum = 0, wy = 0, mx = 0;
+        for (let yy = y0; yy <= y1; yy++) { sum += smoothP[yy]; wy += smoothP[yy] * yy; if (smoothP[yy] > mx) mx = smoothP[yy]; }
+        const cy = sum > 0 ? wy / sum : y;
+        if ((y1 - y0 + 1) <= Math.max(5, h * 0.01)) {
+          const cand = { strip: s, x: (x0 + x1) / 2, y: cy, score: mx };
+          cands.push(cand);
+          seedLike.push({ x: cand.x, y: cand.y });
+        }
+        y = y1 + 2;
+      } else y++;
+    }
+    // Nicht zu viele Text-/Rauschpeaks pro Streifen behalten.
+    cands.sort((a, b) => b.score - a.score);
+    byStrip.push(cands.slice(0, 90).sort((a, b) => a.y - b.y));
+  }
+
+  // Spatium aus kleinen Nachbarabständen je Streifen. Größere Abstände
+  // zwischen Systemen/Textzeilen dürfen den Modus nicht dominieren.
+  const gapBins = new Map<number, { count: number; sum: number }>();
+  for (const cands of byStrip) {
+    const ys = cands.map(c => c.y).sort((a, b) => a - b);
+    for (let i = 1; i < ys.length; i++) {
+      const d = ys[i] - ys[i - 1];
+      if (d >= Math.max(3, h * 0.003) && d <= h * 0.032) {
+        const b = Math.round(d);
+        const cur = gapBins.get(b) ?? { count: 0, sum: 0 };
+        gapBins.set(b, { count: cur.count + 1, sum: cur.sum + d });
+      }
+    }
+  }
+  let spatiumPx = 0;
+  let bestGapCount = 0;
+  for (const v of gapBins.values()) {
+    if (v.count > bestGapCount) { bestGapCount = v.count; spatiumPx = v.sum / v.count; }
+  }
+  if (!spatiumPx) spatiumPx = estimateSpatium(seedLike, h);
+  if (spatiumPx < Math.max(4, h * 0.003) || spatiumPx > h * 0.04) {
+    return { staves: [], spatiumPx, coverage: 0, reason: `Poly: kein Spatium (sp=${spatiumPx.toFixed(1)}, peaks=${seedLike.length}, gapBins=${gapBins.size})`, overlay: null };
+  }
+
+  type PTrack = { pts: TrackPt[]; lastStrip: number; lastY: number; score: number };
+  const tracks: PTrack[] = [];
+  const maxDelta = Math.max(4, spatiumPx * 0.72);
+  for (let s = 0; s < stripCount; s++) {
+    const cands = byStrip[s];
+    cands.forEach(c => { c.used = false; });
+    const active = tracks
+      .filter(t => s - t.lastStrip <= 4)
+      .sort((a, b) => b.pts.length - a.pts.length || b.score - a.score);
+
+    for (const tr of active) {
+      const gap = s - tr.lastStrip;
+      let pred = tr.lastY;
+      if (tr.pts.length >= 2) {
+        const a = tr.pts[tr.pts.length - 2], b = tr.pts[tr.pts.length - 1];
+        const dx = b.x - a.x;
+        if (Math.abs(dx) > 1e-6) pred = b.y + ((b.y - a.y) / dx) * (((s + 0.5) * stripW) - b.x);
+      }
+      let best: Cand | null = null;
+      let bestD = Infinity;
+      for (const c of cands) {
+        if (c.used) continue;
+        const d = Math.abs(c.y - pred);
+        if (d < bestD && d <= maxDelta * Math.max(1, gap * 1.25)) { bestD = d; best = c; }
+      }
+      if (best) {
+        best.used = true;
+        tr.pts.push({ x: best.x, y: best.y });
+        tr.lastStrip = s;
+        tr.lastY = best.y;
+        tr.score += best.score;
+      }
+    }
+
+    for (const c of cands) {
+      if (!c.used && c.score >= Math.max(1.4, (stripW * 0.045))) {
+        tracks.push({ pts: [{ x: c.x, y: c.y }], lastStrip: s, lastY: c.y, score: c.score });
+      }
+    }
+  }
+
+  const minPts = Math.max(4, Math.floor(stripCount * 0.14));
+  const rawTraj = tracks
+    .filter(t => t.pts.length >= minPts)
+    .map(t => trajectoryFromPolynomialPts(t.pts, w))
+    .filter((t): t is Trajectory => !!t)
+    .filter(t => (t.endX - t.startX) >= w * 0.10 && t.residRms <= Math.max(5.0, spatiumPx * 1.15));
+
+  if (rawTraj.length < 12) {
+    return { staves: [], spatiumPx, coverage: 0, reason: `Poly: nur ${rawTraj.length} Kurven aus ${tracks.length} Tracks (sp=${spatiumPx.toFixed(1)})`, overlay: null };
+  }
+
+  const cx = w / 2;
+  const sorted = rawTraj.slice().sort((a, b) => a.evalAtSafe(cx) - b.evalAtSafe(cx));
+  const rowsBest: Trajectory[] = [];
+  for (const t of sorted) {
+    const last = rowsBest[rowsBest.length - 1];
+    if (last && Math.abs(t.evalAtSafe(cx) - last.evalAtSafe(cx)) < spatiumPx * 0.45) {
+      const lastQuality = (last.endX - last.startX) / Math.max(0.5, last.residRms);
+      const thisQuality = (t.endX - t.startX) / Math.max(0.5, t.residRms);
+      if (thisQuality > lastQuality) rowsBest[rowsBest.length - 1] = t;
+    } else rowsBest.push(t);
+  }
+
+  const staves: { rows: Trajectory[] }[] = [];
+  const used = new Set<number>();
+  for (let i = 0; i <= rowsBest.length - 5; i++) {
+    if (used.has(i)) continue;
+    const seq = [i];
+    let lastY = rowsBest[i].evalAtSafe(cx);
+    for (let j = i + 1; j < rowsBest.length && seq.length < 5; j++) {
+      if (used.has(j)) continue;
+      const dy = rowsBest[j].evalAtSafe(cx) - lastY;
+      if (dy < spatiumPx * 0.45) continue;
+      if (dy > spatiumPx * 1.65) break;
+      seq.push(j);
+      lastY = rowsBest[j].evalAtSafe(cx);
+    }
+    if (seq.length === 5) {
+      const gaps = seq.slice(1).map((idx, k) => rowsBest[idx].evalAtSafe(cx) - rowsBest[seq[k]].evalAtSafe(cx));
+      const avgGap = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+      const maxDev = Math.max(...gaps.map(g => Math.abs(g - avgGap)));
+      if (avgGap > spatiumPx * 0.55 && avgGap < spatiumPx * 1.45 && maxDev < avgGap * 0.38) {
+        const five = seq.map(idx => rowsBest[idx]);
+        const cover = Math.max(...five.map(t => t.endX)) - Math.min(...five.map(t => t.startX));
+        if (cover >= w * 0.22) {
+          seq.forEach(idx => used.add(idx));
+          staves.push({ rows: five });
+          i = seq[seq.length - 1];
+        }
+      }
+    }
+  }
+
+  if (staves.length === 0) {
+    return { staves: [], spatiumPx, coverage: 0, reason: `Poly: keine 5er-Staffeln aus ${rowsBest.length} Kurven (raw=${rawTraj.length}, sp=${spatiumPx.toFixed(1)})`, overlay: null };
+  }
+
+  const minX = Math.min(...staves.flatMap(st => st.rows.map(t => t.startX)));
+  const maxX = Math.max(...staves.flatMap(st => st.rows.map(t => t.endX)));
+  const coverage = (maxX - minX) / w;
+  const overlay = document.createElement('canvas');
+  overlay.width = w; overlay.height = h;
+  const octx = overlay.getContext('2d')!;
+  octx.drawImage(small, 0, 0);
+  octx.strokeStyle = '#ef4444';
+  octx.lineWidth = 2;
+  for (const st of staves) for (const t of st.rows) {
+    octx.beginPath();
+    octx.moveTo(t.startX, t.evalAtSafe(t.startX));
+    for (let x = t.startX; x <= t.endX; x += 6) octx.lineTo(x, t.evalAtSafe(x));
     octx.stroke();
   }
   return { staves, spatiumPx, coverage, overlay };
