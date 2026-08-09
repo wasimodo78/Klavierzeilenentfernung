@@ -288,6 +288,127 @@ export function rectifyPerspective(canvas: HTMLCanvasElement, corners: [number, 
   return out;
 }
 
+
+// --- Hauptseiten-Erkennung in Handyfotos ------------------------------------
+// Bei Buch-/Handyfotos ist oft eine zweite Seite oder der Tisch sichtbar. Die
+// reine Extrempunkt-Suche auf der hellen Gesamtfläche nimmt dann das ganze Foto.
+// Diese Routine sucht zeilenweise den dominanten Papier-Lauf (meist die rechte,
+// vollständige Seite), toleriert kleine Tinten-Lücken, aber trennt breite dunkle
+// Falze/Tischbereiche. Daraus entsteht ein robuster Seiten-Quadrilateral.
+export function detectDominantPageCornersByRuns(canvas: HTMLCanvasElement): { corners: [number, number][] | null, evidence: string } {
+  const small = downscale(canvas, 900);
+  const { w, h, lum } = luminanceGrid(small);
+
+  // Adaptiver Hell-/Papier-Schwellwert. Nach boost+normalize liegt Papier hoch,
+  // aber Schatten/vergilbtes Papier sollen noch dazugehören.
+  const hist = new Float64Array(256);
+  for (let i = 0; i < lum.length; i += 5) hist[Math.floor(lum[i])]++;
+  let total = 0, sum = 0;
+  for (let i = 0; i < 256; i++) { total += hist[i]; sum += i * hist[i]; }
+  const mean = total ? sum / total : 180;
+  let sumB = 0, wB = 0, best = 0, otsu = 150;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue;
+    const wF = total - wB; if (!wF) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB, mF = (sum - sumB) / wF;
+    const v = wB * wF * (mB - mF) * (mB - mF);
+    if (v > best) { best = v; otsu = i; }
+  }
+  const paperThr = clampNum(Math.max(otsu, mean * 0.62), 105, 210);
+  const maxGap = Math.max(6, Math.floor(w * 0.025)); // Tinten-/Noten-Lücken ja, Falz nein
+  const minRunW = w * 0.32;
+
+  type RowRun = { y: number; left: number; right: number; width: number };
+  const rows: RowRun[] = [];
+
+  for (let y = 0; y < h; y++) {
+    const off = y * w;
+    let bestRun: RowRun | null = null;
+    let start = -1;
+    let lastBright = -1;
+    let gap = 0;
+
+    const finish = () => {
+      if (start < 0 || lastBright < start) return;
+      const left = start, right = lastBright;
+      const width = right - left + 1;
+      const center = (left + right) / 2;
+      // Rechte/vollständige Seite bevorzugen; linke Nebenseite ist meist schmaler.
+      const score = width * (1 + center / w * 0.18);
+      if (width >= minRunW && center >= w * 0.20) {
+        const cand = { y, left, right, width };
+        const oldScore = bestRun ? bestRun.width * (1 + ((bestRun.left + bestRun.right) / 2) / w * 0.18) : -1;
+        if (!bestRun || score > oldScore) bestRun = cand;
+      }
+    };
+
+    for (let x = 0; x < w; x++) {
+      const bright = lum[off + x] >= paperThr;
+      if (bright) {
+        if (start < 0) start = x;
+        lastBright = x;
+        gap = 0;
+      } else if (start >= 0) {
+        gap++;
+        if (gap > maxGap) {
+          finish();
+          start = -1; lastBright = -1; gap = 0;
+        }
+      }
+    }
+    finish();
+    if (bestRun) rows.push(bestRun);
+  }
+
+  if (rows.length < h * 0.25) return { corners: null, evidence: `zu wenige dominante Papier-Zeilen (${rows.length}/${h}, thr=${paperThr.toFixed(0)})` };
+
+  // Längste zusammenhängende Vertikalzone finden; einzelne ausgefallene Zeilen tolerieren.
+  const sorted = rows.sort((a, b) => a.y - b.y);
+  let bestBand = { a: 0, b: 0, count: 0 };
+  let a = 0, lastY = sorted[0].y, count = 1;
+  const yGapMax = Math.max(4, Math.floor(h * 0.015));
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i].y - lastY <= yGapMax) {
+      count++;
+    } else {
+      if (count > bestBand.count) bestBand = { a, b: i - 1, count };
+      a = i; count = 1;
+    }
+    lastY = sorted[i].y;
+  }
+  if (count > bestBand.count) bestBand = { a, b: sorted.length - 1, count };
+  const band = sorted.slice(bestBand.a, bestBand.b + 1);
+  if (band.length < h * 0.25) return { corners: null, evidence: `kein stabiles Seitenband (${band.length} Zeilen)` };
+
+  const topY = band[0].y;
+  const bottomY = band[band.length - 1].y;
+  const bandH = Math.max(1, bottomY - topY + 1);
+  const edgeWindow = Math.max(5, Math.floor(bandH * 0.035));
+  const median = (vals: number[]) => {
+    const v = vals.slice().sort((x, y) => x - y);
+    return v.length ? v[Math.floor(v.length / 2)] : 0;
+  };
+  const nearTop = band.filter(r => r.y <= topY + edgeWindow);
+  const nearBottom = band.filter(r => r.y >= bottomY - edgeWindow);
+
+  const tl: [number, number] = [median(nearTop.map(r => r.left)), topY];
+  const tr: [number, number] = [median(nearTop.map(r => r.right)), topY];
+  const br: [number, number] = [median(nearBottom.map(r => r.right)), bottomY];
+  const bl: [number, number] = [median(nearBottom.map(r => r.left)), bottomY];
+
+  const topW = tr[0] - tl[0];
+  const bottomW = br[0] - bl[0];
+  if (topW < w * 0.25 || bottomW < w * 0.25 || bandH < h * 0.45) {
+    return { corners: null, evidence: `Geometrie unplausibel topW=${topW.toFixed(0)} bottomW=${bottomW.toFixed(0)} h=${bandH.toFixed(0)}` };
+  }
+
+  return {
+    corners: [tl, tr, br, bl],
+    evidence: `dominante Hauptseite: Y ${topY}-${bottomY}, X oben ${tl[0].toFixed(0)}-${tr[0].toFixed(0)}, unten ${bl[0].toFixed(0)}-${br[0].toFixed(0)}, thr=${paperThr.toFixed(0)}, Zeilen=${band.length}`
+  };
+}
+
 // --- Doppelseiten-Erkennung -------------------------------------------------
 function columnProfile(canvas: HTMLCanvasElement): Float64Array {
   const bin = binarize(canvas);
@@ -721,22 +842,36 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
     debug.stageImages.push({ label: 'Entwölbt (Spur)', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
   } else {
     debug.splitEvidence += `[kein Spur-Gitter: ${trackGrid.reason || 'unbekannt'}] `;
-    const pc = detectPageCorners(work);
-  if (pc.corners) {
-    // Rahmen-Kopie erkennen: Alle Ecken nahe am Bildrand -> Homographie ~Identitaet (kein Gewinn, aber auch kein Risiko)
-    const smallW = downscale(work, 900);
-    const near = (p: [number, number]) => Math.min(p[0], p[1], smallW.width - p[0], smallW.height - p[1]) < smallW.width * 0.04;
-    const allNear = pc.corners.every(near);
-    if (allNear) debug.splitEvidence += '[Kontur=Rahmen, homographie identisch] ';
-    // Ausgabeformat: Seitenverhaeltnis aus Ecken-Geometrie schätzen, sonst A4-Quer/Port je Lage
-    const estW = Math.max( Math.hypot(pc.corners[1][0]-pc.corners[0][0], pc.corners[1][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[3][0], pc.corners[2][1]-pc.corners[3][1]) );
-    const estH = Math.max( Math.hypot(pc.corners[3][0]-pc.corners[0][0], pc.corners[3][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[1][0], pc.corners[2][1]-pc.corners[1][1]) );
-    const tgtW = Math.min(2400, Math.round(estW * 3.2));
-    const tgtH = Math.min(3400, Math.round(estH * 3.2));
-    work = rectifyPerspective(work, pc.corners, tgtW, tgtH);
-    debug.stageImages.push({ label: 'Perspektive entzerrt (Kontur)', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
-    debug.splitEvidence = (pc.corners ? 'Kontur OK. ' : 'Kontur nicht sicher (' + pc.evidence + '). ');
-  }
+
+    // Für Handyfotos zuerst die dominante Hauptseite isolieren. Der alte
+    // Kontur-Fallback nimmt bei Buchfotos sonst gern die komplette helle
+    // Doppelseite inklusive Tisch/zweiter Seite.
+    const runPage = detectDominantPageCornersByRuns(work);
+    let pc = runPage;
+    let contourSource: 'Hauptseite' | 'Kontur' = 'Hauptseite';
+    if (!pc.corners) {
+      debug.splitEvidence += `[Hauptseite nicht sicher: ${runPage.evidence}] `;
+      pc = detectPageCorners(work);
+      contourSource = 'Kontur';
+    }
+
+    if (pc.corners) {
+      // Rahmen-Kopie erkennen: Alle Ecken nahe am Bildrand -> Homographie ~Identitaet.
+      const smallW = downscale(work, 900);
+      const near = (p: [number, number]) => Math.min(p[0], p[1], smallW.width - p[0], smallW.height - p[1]) < smallW.width * 0.04;
+      const allNear = pc.corners.every(near);
+      if (allNear && contourSource === 'Kontur') debug.splitEvidence += '[Kontur=Rahmen, homographie identisch] ';
+      // Ausgabeformat: Seitenverhaeltnis aus Ecken-Geometrie schätzen, sonst A4-Quer/Port je Lage
+      const estW = Math.max( Math.hypot(pc.corners[1][0]-pc.corners[0][0], pc.corners[1][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[3][0], pc.corners[2][1]-pc.corners[3][1]) );
+      const estH = Math.max( Math.hypot(pc.corners[3][0]-pc.corners[0][0], pc.corners[3][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[1][0], pc.corners[2][1]-pc.corners[1][1]) );
+      const tgtW = Math.min(2400, Math.round(estW * 3.2));
+      const tgtH = Math.min(3400, Math.round(estH * 3.2));
+      work = rectifyPerspective(work, pc.corners, tgtW, tgtH);
+      debug.stageImages.push({ label: `Perspektive entzerrt (${contourSource})`, dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
+      debug.splitEvidence += `${contourSource} OK (${pc.evidence}). `;
+    } else {
+      debug.splitEvidence += `Kontur nicht sicher (${pc.evidence}). `;
+    }
   }
 
   // 4. Doppelseiten-Erkennung auf dem entzerrten Bild
