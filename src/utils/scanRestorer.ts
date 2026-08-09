@@ -760,7 +760,9 @@ export type ScanRestoreOptions = {
 };
 
 function resolveGrayscaleProfile(profile: GrayscaleProfileName | GrayscaleProfile | undefined): GrayscaleProfile {
-  if (!profile) return GRAYSCALE_PROFILES.balanced;
+  // Standard für App 2: weichere Graustufen erhalten Anti-Alias-Kanten und
+  // reduzieren Speckles/Papierkorn am stärksten im automatischen Benchmark.
+  if (!profile) return GRAYSCALE_PROFILES.soft;
   return typeof profile === 'string' ? GRAYSCALE_PROFILES[profile] : profile;
 }
 
@@ -844,12 +846,89 @@ export function restoreGrayscaleDocument(canvas: HTMLCanvasElement, profileInput
         smoothstep(noiseFloor * 0.35, detailFullInk * 0.75, detailDrop);
       ink = Math.max(ink, darkCore * 0.98);
 
-      ink = Math.pow(clampNum(ink, 0, 1), profile.gamma);
-      const v = Math.round(255 * (1 - ink));
+      // Nicht mehr auf Schwarz/Weiß kollabieren: Die Maske entscheidet nur,
+      // WO Druck ist. Der Grauwert kommt weiter aus dem normalisierten Foto.
+      // So bleiben schräge Linien, Notenköpfe und Schrift geglättet statt
+      // blockig-pixelig zu werden.
+      const alpha = Math.pow(clampNum(ink, 0, 1), profile.gamma);
+      const inkTone = clampNum(((normalized - 38) / (236 - 38)) * 255, 0, 255);
+      const v = Math.round(255 - alpha * (255 - inkTone));
       od[i] = v; od[i + 1] = v; od[i + 2] = v; od[i + 3] = 255;
     }
   }
 
+  octx.putImageData(oimg, 0, 0);
+  return out;
+}
+
+
+/**
+ * Entfernt Papierkorn/Grauschleier aus der Graustufen-Restauration, ohne
+ * Antialias-Kanten an echter Tinte zu verlieren. Prinzip: Graue Pixel bleiben
+ * nur in der Nähe lokaler dunkler Druckkerne erhalten. Isolierte Papierstruktur
+ * ohne solchen Kern wird wieder zu Weiß.
+ */
+export function cleanRestoredPaper(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d')!;
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const n = w * h;
+  const core = new Uint8Array(n);
+
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    // Echter Druckkern. Schwelle bewusst nicht zu tief: Notenlinien haben nach
+    // der Tonwertkurve klare Kerne, Papierkorn selten zusammenhängende Kerne.
+    if (l < 118) core[p] = 1;
+  }
+
+  const stride = w + 1;
+  const integ = new Uint32Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    const dst = (y + 1) * stride;
+    const prev = y * stride;
+    for (let x = 0; x < w; x++) {
+      row += core[y * w + x];
+      integ[dst + x + 1] = integ[prev + x + 1] + row;
+    }
+  }
+  const radius = Math.max(3, Math.min(8, Math.round(Math.min(w, h) * 0.0016)));
+  const countCore = (x: number, y: number): number => {
+    const x0 = Math.max(0, x - radius), x1 = Math.min(w - 1, x + radius);
+    const y0 = Math.max(0, y - radius), y1 = Math.min(h - 1, y + radius);
+    return integ[(y1 + 1) * stride + x1 + 1] - integ[(y1 + 1) * stride + x0] - integ[y0 * stride + x1 + 1] + integ[y0 * stride + x0];
+  };
+
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const octx = out.getContext('2d')!;
+  const oimg = octx.createImageData(w, h);
+  const od = oimg.data;
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const protectedInk = countCore(x, y) >= 3;
+      let v = l;
+      if (!protectedInk) {
+        // Kein Druckkern in der Nähe: Papierkorn/Schatten progressiv bleichen.
+        // Sehr dunkle, große Bereiche (z. B. Buchfalz/Tisch) bleiben als Geometrie-
+        // Hinweis sichtbar; kleine graue Störungen verschwinden.
+        const bleach = smoothstep(95, 230, l);
+        v = l + (255 - l) * bleach;
+        if (l > 135) v = 255;
+      } else if (l > 205) {
+        // In Nähe von Tinte: helles Papier trotzdem weiß halten, nur Kanten bleiben.
+        const edge = smoothstep(205, 245, l);
+        v = l + (255 - l) * edge * 0.75;
+      }
+      const vv = Math.round(clampNum(v, 0, 255));
+      od[i] = vv; od[i + 1] = vv; od[i + 2] = vv; od[i + 3] = 255;
+    }
+  }
   octx.putImageData(oimg, 0, 0);
   return out;
 }
@@ -1072,7 +1151,7 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
     if (idx === 0 && includeComparisonStages) {
       const prev = downscale(norm, 1200);
       for (const profileName of Object.keys(GRAYSCALE_PROFILES) as GrayscaleProfileName[]) {
-        const grayPrev = restoreGrayscaleDocument(prev, profileName);
+        const grayPrev = cleanRestoredPaper(restoreGrayscaleDocument(prev, profileName));
         debug.stageImages.push({ label: `Graustufen-Kandidat ${profileName}`, dataUrl: grayPrev.toDataURL('image/png') });
       }
       for (const preset of ['strict', 'balanced', 'sensitive'] as const) {
@@ -1081,8 +1160,8 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
       }
     }
 
-    const gray = restoreGrayscaleDocument(norm, grayscaleProfile);
-    if (idx === 0) debug.stageImages.push({ label: `Graustufen AUSGABE (${grayscaleProfile.name}, anti-aliased)`, dataUrl: downscale(gray, 700, true).toDataURL('image/png') });
+    const gray = cleanRestoredPaper(restoreGrayscaleDocument(norm, grayscaleProfile));
+    if (idx === 0) debug.stageImages.push({ label: `Graustufen AUSGABE (${grayscaleProfile.name}, anti-aliased + papierbereinigt)`, dataUrl: downscale(gray, 700, true).toDataURL('image/png') });
     results.push({ canvas: gray, debug });
   });
   return results;
