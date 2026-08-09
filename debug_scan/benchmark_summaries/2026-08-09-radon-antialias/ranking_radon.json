@@ -1,0 +1,114 @@
+{
+  "input": "debug_scan/scan_2026-08-09T07-43-29-775Z_IMG_6375.jpeg/00_input_1_IMG_6375.jpeg",
+  "generatedAt": "2026-08-09T07:56:52.892Z",
+  "results": [
+    {
+      "profile": "soft",
+      "file": "result_soft.png",
+      "debugFile": "debug_soft.json",
+      "metrics": {
+        "width": 3783,
+        "height": 5034,
+        "p50": 255,
+        "p90": 255,
+        "p97": 255,
+        "darkPct": 0.0789507071547421,
+        "inkPct": 0.15305688435940099,
+        "grayEdgeRatio": 0.9137108089102083,
+        "blackCoreRatio": 0.2854473618948291,
+        "tinyComponentsPerMP": 1857.0070613796847,
+        "score": 61.003380103245505
+      },
+      "stageLabels": [
+        "Original",
+        "Kontrastverbesserung",
+        "Vereinheitlichung",
+        "Ausgerichtet (-9.20°)",
+        "Perspektive entzerrt (Kontur)",
+        "Schatten entfernt",
+        "Graustufen AUSGABE (soft, anti-aliased + papierbereinigt)"
+      ]
+    },
+    {
+      "profile": "balanced",
+      "file": "result_balanced.png",
+      "debugFile": "debug_balanced.json",
+      "metrics": {
+        "width": 3783,
+        "height": 5034,
+        "p50": 255,
+        "p90": 255,
+        "p97": 255,
+        "darkPct": 0.08249688019966722,
+        "inkPct": 0.158096921797005,
+        "grayEdgeRatio": 0.9070619499296173,
+        "blackCoreRatio": 0.2924433978398432,
+        "tinyComponentsPerMP": 1619.364475828354,
+        "score": 60.94466652582058
+      },
+      "stageLabels": [
+        "Original",
+        "Kontrastverbesserung",
+        "Vereinheitlichung",
+        "Ausgerichtet (-9.20°)",
+        "Perspektive entzerrt (Kontur)",
+        "Schatten entfernt",
+        "Graustufen AUSGABE (balanced, anti-aliased + papierbereinigt)"
+      ]
+    },
+    {
+      "profile": "crisp",
+      "file": "result_crisp.png",
+      "debugFile": "debug_crisp.json",
+      "metrics": {
+        "width": 3783,
+        "height": 5034,
+        "p50": 255,
+        "p90": 255,
+        "p97": 255,
+        "darkPct": 0.084891846921797,
+        "inkPct": 0.16098533693843595,
+        "grayEdgeRatio": 0.8995436149699457,
+        "blackCoreRatio": 0.2990856149893252,
+        "tinyComponentsPerMP": 1413.6338946224878,
+        "score": 60.55052480436364
+      },
+      "stageLabels": [
+        "Original",
+        "Kontrastverbesserung",
+        "Vereinheitlichung",
+        "Ausgerichtet (-9.20°)",
+        "Perspektive entzerrt (Kontur)",
+        "Schatten entfernt",
+        "Graustufen AUSGABE (crisp, anti-aliased + papierbereinigt)"
+      ]
+    },
+    {
+      "profile": "inkRich",
+      "file": "result_inkRich.png",
+      "debugFile": "debug_inkRich.json",
+      "metrics": {
+        "width": 3783,
+        "height": 5034,
+        "p50": 255,
+        "p90": 255,
+        "p97": 255,
+        "darkPct": 0.08557300332778703,
+        "inkPct": 0.16237676788685523,
+        "grayEdgeRatio": 0.8990979336050954,
+        "blackCoreRatio": 0.2991869554218449,
+        "tinyComponentsPerMP": 1345.7360130363932,
+        "score": 60.42153599405411
+      },
+      "stageLabels": [
+        "Original",
+        "Kontrastverbesserung",
+        "Vereinheitlichung",
+        "Ausgerichtet (-9.20°)",
+        "Perspektive entzerrt (Kontur)",
+        "Schatten entfernt",
+        "Graustufen AUSGABE (inkRich, anti-aliased + papierbereinigt)"
+      ]
+    }
+  ]
+}

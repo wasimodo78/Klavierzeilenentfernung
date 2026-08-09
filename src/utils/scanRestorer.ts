@@ -108,6 +108,108 @@ export function estimateOrientation90(canvas: HTMLCanvasElement): { rotate90: bo
   return { rotate90: cols > rows * 1.1, votes };
 }
 
+
+// --- Min-Pooling + Staff-Edge-Radon-Deskew ----------------------------------
+// Normales Canvas-Downscaling mittelt 1px-Notenlinien weg. Für die Winkelmessung
+// verkleinern wir deshalb per Min-Pooling: jeder Zielpixel übernimmt die dunkelste
+// Quell-Luminanz im entsprechenden Block. Dünne horizontale Stafflinien bleiben
+// sicher erhalten.
+type GrayMinPool = { gray: Uint8Array; w: number; h: number; scale: number };
+
+type EdgePoint = { x: number; y: number; weight: number };
+
+function minPoolGrayscale(canvas: HTMLCanvasElement, maxDim = 1200): GrayMinPool {
+  const sw = canvas.width, sh = canvas.height;
+  const scale = Math.min(1, maxDim / Math.max(sw, sh));
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
+  const d = canvas.getContext('2d')!.getImageData(0, 0, sw, sh).data;
+  const gray = new Uint8Array(w * h);
+
+  for (let y = 0; y < h; y++) {
+    const sy0 = Math.floor(y / scale);
+    const sy1 = Math.min(sh - 1, Math.max(sy0, Math.ceil((y + 1) / scale) - 1));
+    for (let x = 0; x < w; x++) {
+      const sx0 = Math.floor(x / scale);
+      const sx1 = Math.min(sw - 1, Math.max(sx0, Math.ceil((x + 1) / scale) - 1));
+      let minL = 255;
+      for (let sy = sy0; sy <= sy1; sy++) {
+        for (let sx = sx0; sx <= sx1; sx++) {
+          const i = (sy * sw + sx) * 4;
+          const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+          if (l < minL) minL = l;
+        }
+      }
+      gray[y * w + x] = minL;
+    }
+  }
+  return { gray, w, h, scale };
+}
+
+function extractHorizontalStaffEdges(mp: GrayMinPool): EdgePoint[] {
+  const { gray, w, h } = mp;
+  const pts: EdgePoint[] = [];
+  const step = Math.max(1, Math.floor(Math.max(w, h) / 1600));
+  for (let y = 1; y < h - 1; y += step) {
+    for (let x = 1; x < w - 1; x += step) {
+      const i = y * w + x;
+      const dy = Math.abs(gray[i + w] - gray[i - w]);
+      const dx = Math.abs(gray[i + 1] - gray[i - 1]);
+      // Vertikaler Gradient = Kante einer horizontalen Linie. Die lokale
+      // Helligkeitsschranke entfernt viel Papiertextur, erhält aber blasse Linien.
+      if (dy > 24 && dy > dx * 1.18 && gray[i] < 246) {
+        pts.push({ x, y, weight: Math.min(4, 1 + dy / 48) });
+      }
+    }
+  }
+
+  // Performance-Kappe deterministisch: jedes n-te Pixel, nicht random.
+  const maxPts = 180_000;
+  if (pts.length <= maxPts) return pts;
+  const stride = Math.ceil(pts.length / maxPts);
+  return pts.filter((_, i) => i % stride === 0);
+}
+
+function radonSharpness(points: EdgePoint[], w: number, h: number, deg: number): number {
+  const rad = deg * Math.PI / 180;
+  const sin = Math.sin(rad), cos = Math.cos(rad);
+  const minY = Math.min(0, w * sin, h * cos, w * sin + h * cos) - 2;
+  const maxY = Math.max(0, w * sin, h * cos, w * sin + h * cos) + 2;
+  const bins = new Float64Array(Math.ceil(maxY - minY) + 4);
+  for (const p of points) {
+    const yr = p.x * sin + p.y * cos;
+    const b = Math.round(yr - minY);
+    if (b >= 0 && b < bins.length) bins[b] += p.weight;
+  }
+  let score = 0;
+  for (let i = 1; i < bins.length; i++) {
+    const d = bins[i] - bins[i - 1];
+    score += d * d;
+  }
+  return score;
+}
+
+function bestRadonAngle(points: EdgePoint[], w: number, h: number): { angleDeg: number; votes: string } {
+  if (points.length < 200) return { angleDeg: 0, votes: `zu wenige Staff-Kanten (${points.length})` };
+  let best = 0;
+  let bestScore = -Infinity;
+  const coarseVotes: string[] = [];
+  const test = (a: number) => {
+    const s = radonSharpness(points, w, h, a);
+    if (s > bestScore) { bestScore = s; best = a; }
+    return s;
+  };
+  for (let a = -20; a <= 20.0001; a += 0.5) {
+    const s = test(a);
+    if (Math.abs(a % 2) < 1e-6) coarseVotes.push(`${a.toFixed(0)}°:${(s / 1e6).toFixed(1)}`);
+  }
+  const cBest = best;
+  for (let a = cBest - 0.7; a <= cBest + 0.7001; a += 0.1) test(a);
+  const fBest = best;
+  for (let a = fBest - 0.16; a <= fBest + 0.1601; a += 0.02) test(a);
+  return { angleDeg: best, votes: `edges=${points.length} ${coarseVotes.join(' ')} best=${best.toFixed(3)} score=${(bestScore / 1e6).toFixed(1)}` };
+}
+
 // --- Feinwinkel über Projektionsschärfe ------------------------------------
 export function rotateCanvas(src: HTMLCanvasElement, deg: number): HTMLCanvasElement {
   const rad = deg * Math.PI / 180;
@@ -135,34 +237,11 @@ function projectionSharpness(canvas: HTMLCanvasElement): number {
 }
 
 export function estimateFineAngle(canvas: HTMLCanvasElement): { angleDeg: number, votes: string } {
-  const small = downscale(canvas, 900);
-  const bin0 = binarize(small);
-  const sharpOf = (deg: number): number => {
-    const r = rotateBinary(bin0, small.width, small.height, deg);
-    let score = 0;
-    for (let y = 0; y < r.h; y += 2) {
-      let b = 0;
-      const o = y * r.w;
-      for (let x = 0; x < r.w; x++) b += r.bin[o + x];
-      score += b * b;
-    }
-    return score;
-  };
-  let best = 0, bestScore = -Infinity;
-  const coarse: [number, number][] = [];
-  for (let a = -20; a <= 20; a += 1) {
-    const s = sharpOf(a);
-    coarse.push([a, s]);
-    if (s > bestScore) { bestScore = s; best = a; }
-  }
-  for (let a = best - 0.75; a <= best + 0.75; a += 0.05) {
-    const s = sharpOf(a);
-    if (s > bestScore) { bestScore = s; best = a; }
-  }
-  // Falls der beste Grobwert am Rand liegt (-20/20), nicht vorzeitig glauben
-  const edge = Math.abs(best) >= 19.9;
-  return { angleDeg: edge ? best : best, votes: coarse.map(([a, s]) => `${a}°:${(s / 1e9).toFixed(2)}`).join(' ') + (edge ? ' [RAND!]' : '') };
+  const mp = minPoolGrayscale(canvas, 1200);
+  const pts = extractHorizontalStaffEdges(mp);
+  return bestRadonAngle(pts, mp.w, mp.h);
 }
+
 
 // --- Perspektivische Rektifizierung über Papierkontur -----------------------
 // Hintergrund/Ecken: Finde die Papier-Ecken als Extrempunkte der hellen
@@ -933,6 +1012,77 @@ export function cleanRestoredPaper(canvas: HTMLCanvasElement): HTMLCanvasElement
   return out;
 }
 
+
+/**
+ * Edge-aware Antialiasing für restaurierte Graustufen.
+ *
+ * Die Restaurierung arbeitet hochkontrastig, damit Notenlinien klar bleiben. An
+ * schrägen Linien können dadurch trotzdem Treppenkanten sichtbar werden. Dieser
+ * Pass glättet nur Pixel in direkter Nähe von Tinte; stabile schwarze Kerne und
+ * weißes Papier bleiben unverändert. Er ist kein allgemeiner Blur.
+ */
+export function antialiasInkEdges(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d')!;
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const lum = new Uint8Array(w * h);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) lum[p] = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const octx = out.getContext('2d')!;
+  const oimg = octx.createImageData(w, h);
+  const od = oimg.data;
+  od.set(d);
+
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const p = y * w + x;
+      const c = lum[p];
+      let minN = 255, maxN = 0, darkN = 0;
+      let weighted = c * 4;
+      let weight = 4;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const q = (y + dy) * w + (x + dx);
+          const v = lum[q];
+          if (v < minN) minN = v;
+          if (v > maxN) maxN = v;
+          if (v < 95) darkN++;
+          const wt = (dx === 0 || dy === 0) ? 2 : 1;
+          weighted += v * wt;
+          weight += wt;
+        }
+      }
+
+      // Solide schwarze Kerne nicht aufweichen; gerade bei Notenköpfen und
+      // dicken Balken muss die Mitte satt bleiben.
+      if (c < 55 && darkN >= 4) continue;
+
+      // Nur Tintennähe glätten: entweder Pixel selbst ist Grau/Schwarz oder ein
+      // direkter Nachbar hat deutlichen Druck. Papier ohne Tintennachbarschaft
+      // bleibt 255.
+      const nearInk = c < 245 || minN < 120;
+      const isEdge = nearInk && (maxN - minN > 45 || (c > 55 && c < 238));
+      if (!isEdge) continue;
+
+      let v = weighted / weight;
+      // Weiße Pixel direkt neben schwarzer Tinte bekommen nur einen leichten
+      // Grausaum, keine Verschmutzung.
+      if (c > 238 && minN < 90) v = Math.max(218, v);
+      // Dunkle Kanten bleiben kontrastreich, werden aber subpixelig abgerundet.
+      if (c < 100) v = Math.min(c + 18, v);
+      const vv = Math.round(clampNum(v, 0, 255));
+      const i = p * 4;
+      od[i] = vv; od[i + 1] = vv; od[i + 2] = vv; od[i + 3] = 255;
+    }
+  }
+  octx.putImageData(oimg, 0, 0);
+  return out;
+}
+
 type BinarizePreset = 'strict' | 'balanced' | 'sensitive';
 
 type BinarizeProfile = {
@@ -1103,7 +1253,7 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
       const estH = Math.max( Math.hypot(pc.corners[3][0]-pc.corners[0][0], pc.corners[3][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[1][0], pc.corners[2][1]-pc.corners[1][1]) );
       // Nicht künstlich auf ~2400px herunterrechnen: Bei restaurierter Ausgabe
       // sieht man sonst Treppenstufen sofort. Wir bleiben nah an der realen
-      // Fotoauflösung und geben ca. 25% Supersampling dazu; die finale
+      // Fotoauflösung und geben deutliches Supersampling dazu; die finale
       // Tonwert-/Graustufenrekonstruktion passiert erst danach.
       const scaleProbe = downscale(work, 900);
       const sourceScale = work.width / scaleProbe.width;
@@ -1151,7 +1301,7 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
     if (idx === 0 && includeComparisonStages) {
       const prev = downscale(norm, 1200);
       for (const profileName of Object.keys(GRAYSCALE_PROFILES) as GrayscaleProfileName[]) {
-        const grayPrev = cleanRestoredPaper(restoreGrayscaleDocument(prev, profileName));
+        const grayPrev = antialiasInkEdges(cleanRestoredPaper(restoreGrayscaleDocument(prev, profileName)));
         debug.stageImages.push({ label: `Graustufen-Kandidat ${profileName}`, dataUrl: grayPrev.toDataURL('image/png') });
       }
       for (const preset of ['strict', 'balanced', 'sensitive'] as const) {
@@ -1160,7 +1310,7 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
       }
     }
 
-    const gray = cleanRestoredPaper(restoreGrayscaleDocument(norm, grayscaleProfile));
+    const gray = antialiasInkEdges(cleanRestoredPaper(restoreGrayscaleDocument(norm, grayscaleProfile)));
     if (idx === 0) debug.stageImages.push({ label: `Graustufen AUSGABE (${grayscaleProfile.name}, anti-aliased + papierbereinigt)`, dataUrl: downscale(gray, 700, true).toDataURL('image/png') });
     results.push({ canvas: gray, debug });
   });

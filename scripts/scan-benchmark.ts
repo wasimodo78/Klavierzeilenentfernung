@@ -203,7 +203,11 @@ if (!input) {
 const outDir = process.argv[3] ?? makeOutDir(input);
 mkdirSync(outDir, { recursive: true });
 
-const profiles = Object.keys(GRAYSCALE_PROFILES) as GrayscaleProfileName[];
+const requestedProfiles = (process.env.SCAN_PROFILES ?? process.argv[4] ?? '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean) as GrayscaleProfileName[];
+const profiles = requestedProfiles.length > 0 ? requestedProfiles : (Object.keys(GRAYSCALE_PROFILES) as GrayscaleProfileName[]);
 const results: VariantResult[] = [];
 console.log(`Input: ${input}`);
 console.log(`Output: ${outDir}`);
