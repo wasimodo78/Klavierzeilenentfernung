@@ -1029,57 +1029,45 @@ export function antialiasInkEdges(canvas: HTMLCanvasElement): HTMLCanvasElement 
   const lum = new Uint8Array(w * h);
   for (let i = 0, p = 0; i < d.length; i += 4, p++) lum[p] = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
 
-  const out = document.createElement('canvas');
-  out.width = w; out.height = h;
-  const octx = out.getContext('2d')!;
-  const oimg = octx.createImageData(w, h);
-  const od = oimg.data;
-  od.set(d);
-
+  // Wir schreiben direkt in das gelesene ImageData zurück. Dadurch sparen wir
+  // einen kompletten zusätzlichen RGBA-Puffer (~75MB bei Handyfotos).
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const p = y * w + x;
       const c = lum[p];
       let minN = 255, maxN = 0, darkN = 0;
-      let weighted = c * 4;
-      let weight = 4;
       for (let dy = -1; dy <= 1; dy++) {
         for (let dx = -1; dx <= 1; dx++) {
           if (dx === 0 && dy === 0) continue;
-          const q = (y + dy) * w + (x + dx);
-          const v = lum[q];
+          const v = lum[(y + dy) * w + x + dx];
           if (v < minN) minN = v;
           if (v > maxN) maxN = v;
-          if (v < 95) darkN++;
-          const wt = (dx === 0 || dy === 0) ? 2 : 1;
-          weighted += v * wt;
-          weight += wt;
+          if (v < 80) darkN++;
         }
       }
 
-      // Solide schwarze Kerne nicht aufweichen; gerade bei Notenköpfen und
-      // dicken Balken muss die Mitte satt bleiben.
-      if (c < 55 && darkN >= 4) continue;
-
-      // Nur Tintennähe glätten: entweder Pixel selbst ist Grau/Schwarz oder ein
-      // direkter Nachbar hat deutlichen Druck. Papier ohne Tintennachbarschaft
-      // bleibt 255.
-      const nearInk = c < 245 || minN < 120;
-      const isEdge = nearInk && (maxN - minN > 45 || (c > 55 && c < 238));
+      const nearInk = c < 245 || minN < 130;
+      const isEdge = nearInk && (maxN - minN > 35 || (c > 50 && c < 240));
       if (!isEdge) continue;
+      if (c < 52 && darkN >= 4) continue; // solider Kern bleibt schwarz
 
-      let v = weighted / weight;
-      // Weiße Pixel direkt neben schwarzer Tinte bekommen nur einen leichten
-      // Grausaum, keine Verschmutzung.
-      if (c > 238 && minN < 90) v = Math.max(218, v);
-      // Dunkle Kanten bleiben kontrastreich, werden aber subpixelig abgerundet.
-      if (c < 100) v = Math.min(c + 18, v);
+      const v00 = lum[(y - 1) * w + x - 1], v01 = lum[(y - 1) * w + x], v02 = lum[(y - 1) * w + x + 1];
+      const v10 = lum[y * w + x - 1],       v11 = c,                    v12 = lum[y * w + x + 1];
+      const v20 = lum[(y + 1) * w + x - 1], v21 = lum[(y + 1) * w + x], v22 = lum[(y + 1) * w + x + 1];
+      let v = (v00 + 2 * v01 + v02 + 2 * v10 + 4 * v11 + 2 * v12 + v20 + 2 * v21 + v22) / 16;
+      // Schwarze Einzel-Treppenpixel an Kanten deutlich in Graukante überführen;
+      // nicht aber Kerne von Notenköpfen/Balken.
+      if (c < 95 && darkN < 4) v = Math.max(v, c + 34);
+      // Weiß direkt neben Tinte nur leicht anschatten, nicht verschmutzen.
+      if (c > 238 && minN < 100) v = Math.max(222, v);
       const vv = Math.round(clampNum(v, 0, 255));
       const i = p * 4;
-      od[i] = vv; od[i + 1] = vv; od[i + 2] = vv; od[i + 3] = 255;
+      d[i] = vv; d[i + 1] = vv; d[i + 2] = vv; d[i + 3] = 255;
     }
   }
-  octx.putImageData(oimg, 0, 0);
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  out.getContext('2d')!.putImageData(img, 0, 0);
   return out;
 }
 
