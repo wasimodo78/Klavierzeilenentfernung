@@ -1942,6 +1942,59 @@ export function estimatePolynomialStaffGrid(canvas: HTMLCanvasElement): GridResu
     }
   }
 
+  // Relaxed Fallback: In real scans text, clefs and note stems create extra
+  // horizontal curves between staff lines. Instead of taking the next 4 rows
+  // sequentially, search for rows close to y0 + k*spatium and ignore unrelated
+  // curves. This is the important step for treating staff lines as polynomial
+  // families robustly.
+  if (staves.length < 4) {
+    const usedRelax = new Set(staves.flatMap(st => st.rows.map(r => rowsBest.indexOf(r))).filter(i => i >= 0));
+    type CandStaff = { idxs: number[]; score: number; y0: number };
+    const candStaves: CandStaff[] = [];
+    for (let i = 0; i < rowsBest.length; i++) {
+      const y0 = rowsBest[i].evalAtSafe(cx);
+      for (let f = 0.72; f <= 1.38; f += 0.06) {
+        const spc = spatiumPx * f;
+        const idxs = [i];
+        let err = 0;
+        for (let k = 1; k < 5; k++) {
+          const target = y0 + k * spc;
+          let bestJ = -1, bestD = Infinity;
+          for (let j = i + 1; j < rowsBest.length; j++) {
+            const yy = rowsBest[j].evalAtSafe(cx);
+            const d = Math.abs(yy - target);
+            if (d < bestD) { bestD = d; bestJ = j; }
+            if (yy > target + spc * 0.55) break;
+          }
+          if (bestJ < 0 || bestD > spc * 0.42) { idxs.length = 0; break; }
+          idxs.push(bestJ);
+          err += bestD / spc;
+        }
+        if (idxs.length === 5 && new Set(idxs).size === 5) {
+          const five = idxs.map(idx => rowsBest[idx]);
+          const cover = Math.max(...five.map(t => t.endX)) - Math.min(...five.map(t => t.startX));
+          const avgResid = five.reduce((s, t) => s + t.residRms, 0) / 5;
+          if (cover >= w * 0.18 && avgResid <= Math.max(6, spatiumPx * 1.3)) {
+            candStaves.push({ idxs, y0, score: cover / w - err * 0.35 - avgResid / Math.max(4, spatiumPx) * 0.08 });
+          }
+        }
+      }
+    }
+    candStaves.sort((a, b) => b.score - a.score);
+    for (const cs of candStaves) {
+      if (cs.idxs.some(i => usedRelax.has(i))) continue;
+      const yMid = cs.y0 + 2 * spatiumPx;
+      const overlapsExisting = staves.some(st => {
+        const sy = st.rows[2].evalAtSafe(cx);
+        return Math.abs(sy - yMid) < spatiumPx * 3;
+      });
+      if (overlapsExisting) continue;
+      cs.idxs.forEach(i => usedRelax.add(i));
+      staves.push({ rows: cs.idxs.map(i => rowsBest[i]) });
+    }
+    staves.sort((a, b) => a.rows[0].evalAtSafe(cx) - b.rows[0].evalAtSafe(cx));
+  }
+
   if (staves.length === 0) {
     return { staves: [], spatiumPx, coverage: 0, reason: `Poly: keine 5er-Staffeln aus ${rowsBest.length} Kurven (raw=${rawTraj.length}, sp=${spatiumPx.toFixed(1)})`, overlay: null };
   }
@@ -1961,7 +2014,7 @@ export function estimatePolynomialStaffGrid(canvas: HTMLCanvasElement): GridResu
     for (let x = t.startX; x <= t.endX; x += 6) octx.lineTo(x, t.evalAtSafe(x));
     octx.stroke();
   }
-  return { staves, spatiumPx, coverage, overlay };
+  return { staves, spatiumPx, coverage, overlay, reason: `Poly: ${staves.length} Staffeln aus ${rowsBest.length} Kurven (raw=${rawTraj.length}, sp=${spatiumPx.toFixed(1)})` };
 }
 
 // Entzerrung ueber die gemessenen Trajektorien (Y-Achse)
@@ -2046,11 +2099,15 @@ export function dewarpByTracks(canvas: HTMLCanvasElement, grid: GridResult): HTM
 // nur lokale Y-Verschiebungen in der Nähe erkannter Stafflinien angewandt, sodass
 // gekrümmte Linien an ihrer vorhandenen Seitenposition geglättet werden.
 export function straightenStaffBands(canvas: HTMLCanvasElement, grid: GridResult): { canvas: HTMLCanvasElement; evidence: string } {
-  if (!grid.overlay || grid.staves.length < 4 || grid.spatiumPx <= 0) {
+  if (!grid.overlay || grid.staves.length < 3 || grid.spatiumPx <= 0) {
     return { canvas, evidence: `kein lokales Entwölben (staves=${grid.staves.length}, sp=${grid.spatiumPx.toFixed(1)})` };
   }
 
   const W = canvas.width, H = canvas.height;
+  const pixels = W * H;
+  if (pixels > 10_000_000) {
+    return { canvas, evidence: `lokales Entwölben übersprungen (Speicherschutz ${(pixels / 1_000_000).toFixed(1)}MP, staves=${grid.staves.length})` };
+  }
   const smallW = grid.overlay.width, smallH = grid.overlay.height;
   const sx = W / smallW, sy = H / smallH;
   const sp = grid.spatiumPx * sy;
@@ -2071,7 +2128,7 @@ export function straightenStaffBands(canvas: HTMLCanvasElement, grid: GridResult
     }
   }
   rows.sort((a, b) => a.targetY - b.targetY);
-  if (rows.length < 20) return { canvas, evidence: `zu wenige Staff-Zeilen (${rows.length})` };
+  if (rows.length < 15) return { canvas, evidence: `zu wenige Staff-Zeilen (${rows.length})` };
 
   const maxAbsDelta = sp * 2.2;
   const bandRadius = sp * 2.4;
@@ -2082,8 +2139,6 @@ export function straightenStaffBands(canvas: HTMLCanvasElement, grid: GridResult
   const out = document.createElement('canvas');
   out.width = W; out.height = H;
   const octx = out.getContext('2d')!;
-  const oimg = octx.createImageData(W, H);
-  const od = oimg.data;
 
   const sample = (x: number, y: number): [number, number, number] => {
     const yy = clampNum(y, 0, H - 1);
@@ -2099,38 +2154,44 @@ export function straightenStaffBands(canvas: HTMLCanvasElement, grid: GridResult
   };
 
   let correctedRows = 0;
-  for (let y = 0; y < H; y++) {
-    const candidates = rows.filter(r => Math.abs(r.targetY - y) <= bandRadius);
-    if (candidates.length === 0) {
-      od.set(sd.subarray(y * W * 4, (y + 1) * W * 4), y * W * 4);
-      continue;
-    }
-    correctedRows++;
-    for (let x = 0; x < W; x++) {
-      const xSmall = x / sx;
-      let sumW = 0;
-      let sumD = 0;
-      for (const r of candidates) {
-        if (xSmall < r.startX || xSmall > r.endX) continue;
-        const dist = y - r.targetY;
-        const wt = Math.exp(-(dist * dist) / (2 * sigma * sigma));
-        if (wt < 0.005) continue;
-        sumW += wt;
-        sumD += wt * clampNum(r.deltaAt(xSmall), -maxAbsDelta, maxAbsDelta);
+  const stripeH = 128;
+  for (let yBase = 0; yBase < H; yBase += stripeH) {
+    const hStripe = Math.min(stripeH, H - yBase);
+    const oimg = octx.createImageData(W, hStripe);
+    const od = oimg.data;
+    for (let yy = 0; yy < hStripe; yy++) {
+      const y = yBase + yy;
+      const candidates = rows.filter(r => Math.abs(r.targetY - y) <= bandRadius);
+      if (candidates.length === 0) {
+        od.set(sd.subarray(y * W * 4, (y + 1) * W * 4), yy * W * 4);
+        continue;
       }
-      const dst = (y * W + x) * 4;
-      if (sumW <= 0) {
-        const srcIdx = dst;
-        od[dst] = sd[srcIdx]; od[dst + 1] = sd[srcIdx + 1]; od[dst + 2] = sd[srcIdx + 2]; od[dst + 3] = 255;
-      } else {
-        const delta = sumD / sumW;
-        const [r, g, b] = sample(x, y + delta);
-        od[dst] = r; od[dst + 1] = g; od[dst + 2] = b; od[dst + 3] = 255;
+      correctedRows++;
+      for (let x = 0; x < W; x++) {
+        const xSmall = x / sx;
+        let sumW = 0;
+        let sumD = 0;
+        for (const r of candidates) {
+          if (xSmall < r.startX || xSmall > r.endX) continue;
+          const dist = y - r.targetY;
+          const wt = Math.exp(-(dist * dist) / (2 * sigma * sigma));
+          if (wt < 0.005) continue;
+          sumW += wt;
+          sumD += wt * clampNum(r.deltaAt(xSmall), -maxAbsDelta, maxAbsDelta);
+        }
+        const dst = (yy * W + x) * 4;
+        if (sumW <= 0) {
+          const srcIdx = (y * W + x) * 4;
+          od[dst] = sd[srcIdx]; od[dst + 1] = sd[srcIdx + 1]; od[dst + 2] = sd[srcIdx + 2]; od[dst + 3] = 255;
+        } else {
+          const delta = sumD / sumW;
+          const [r, g, b] = sample(x, y + delta);
+          od[dst] = r; od[dst + 1] = g; od[dst + 2] = b; od[dst + 3] = 255;
+        }
       }
     }
+    octx.putImageData(oimg, 0, yBase);
   }
-
-  octx.putImageData(oimg, 0, 0);
   return { canvas: out, evidence: `lokal entwölbt: ${grid.staves.length} Staffeln/${rows.length} Zeilen, ${correctedRows} Bildzeilen korrigiert, sp=${sp.toFixed(1)}px` };
 }
 
