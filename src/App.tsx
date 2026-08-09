@@ -772,7 +772,7 @@ export default function App() {
                       <p className="text-sm font-medium text-emerald-800">Seite {idx + 1} — restauriert</p>
                     </div>
                     <div className="p-4 flex flex-col md:flex-row gap-4 items-start">
-                      <img src={downscale(p.canvas, 900, false).toDataURL('image/png')} alt={`Restauriert Seite ${idx + 1}`} className="w-full md:w-2/3 object-contain border border-slate-100 rounded" />
+                      <img src={downscale(p.canvas, 900, true).toDataURL('image/png')} alt={`Restauriert Seite ${idx + 1}`} className="w-full md:w-2/3 object-contain border border-slate-100 rounded" />
 
                       {/* Debugging-Belege (Messen, Stufen, Werte) */}
                       <div className="w-full md:w-1/3 space-y-3">

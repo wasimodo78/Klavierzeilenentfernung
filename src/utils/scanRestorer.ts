@@ -862,8 +862,16 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
       // Ausgabeformat: Seitenverhaeltnis aus Ecken-Geometrie schätzen, sonst A4-Quer/Port je Lage
       const estW = Math.max( Math.hypot(pc.corners[1][0]-pc.corners[0][0], pc.corners[1][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[3][0], pc.corners[2][1]-pc.corners[3][1]) );
       const estH = Math.max( Math.hypot(pc.corners[3][0]-pc.corners[0][0], pc.corners[3][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[1][0], pc.corners[2][1]-pc.corners[1][1]) );
-      const tgtW = Math.min(2400, Math.round(estW * 3.2));
-      const tgtH = Math.min(3400, Math.round(estH * 3.2));
+      // Nicht künstlich auf ~2400px herunterrechnen: Bei binärer Ausgabe sieht
+      // man sonst die Treppenstufen sofort. Wir bleiben nah an der realen
+      // Fotoauflösung und geben ca. 25% Supersampling dazu; die finale
+      // 0/255-Binarisierung passiert erst danach.
+      const scaleProbe = downscale(work, 900);
+      const sourceScale = work.width / scaleProbe.width;
+      const restoreScale = sourceScale * 1.25;
+      scaleProbe.width = 0; scaleProbe.height = 0;
+      const tgtW = Math.min(4800, Math.max(1200, Math.round(estW * restoreScale)));
+      const tgtH = Math.min(6800, Math.max(1600, Math.round(estH * restoreScale)));
       work = rectifyPerspective(work, pc.corners, tgtW, tgtH);
       debug.stageImages.push({ label: `Perspektive entzerrt (${contourSource})`, dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
       debug.splitEvidence += `${contourSource} OK (${pc.evidence}). `;
@@ -910,7 +918,7 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
     }
 
     const bw = binarizeMusicDocument(norm, 'balanced');
-    if (idx === 0) debug.stageImages.push({ label: 'Schwarz-Weiß AUSGABE (balanced, echte 0/255-Pixel)', dataUrl: downscale(bw, 700, false).toDataURL('image/png') });
+    if (idx === 0) debug.stageImages.push({ label: 'Schwarz-Weiß AUSGABE (balanced, echte 0/255-Pixel)', dataUrl: downscale(bw, 700, true).toDataURL('image/png') });
     results.push({ canvas: bw, debug });
   });
   return results;

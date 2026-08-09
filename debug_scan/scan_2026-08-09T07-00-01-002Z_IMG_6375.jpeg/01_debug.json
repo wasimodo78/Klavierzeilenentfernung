@@ -1,0 +1,21 @@
+{
+  "sourceLabel": "Quelle 1/1 (IMG_6375.jpeg)",
+  "pageIndex": 1,
+  "orientationVotes": "0°=0.01 90°=0.01",
+  "fineAngleDeg": -0.1499999999999999,
+  "split": "einseitig",
+  "splitColumnX": null,
+  "splitEvidence": "[kein Spur-Gitter: unbekannt] [Kontur=Rahmen, homographie identisch] Kontur OK (Ecken gefunden: TL(0,12) TR(674,0) BR(616,886) BL(0,899) Papier 99%, Schwellwert 143). Tinte-Tal 0.95 (bw 31px), Lum-Tal 1.00 -> kein Split",
+  "stageLabels": [
+    "Original",
+    "Kontrastverbesserung",
+    "Vereinheitlichung",
+    "Ausgerichtet (-0.15°)",
+    "Perspektive entzerrt (Kontur)",
+    "Schatten entfernt",
+    "SW-Kandidat strict",
+    "SW-Kandidat balanced",
+    "SW-Kandidat sensitive",
+    "Schwarz-Weiß AUSGABE (balanced, echte 0/255-Pixel)"
+  ]
+}
