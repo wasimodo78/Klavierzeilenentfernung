@@ -696,6 +696,68 @@ function conservativeClean(bin: Uint8Array, w: number, h: number): Uint8Array {
   return out;
 }
 
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = clampNum((x - edge0) / Math.max(1e-6, edge1 - edge0), 0, 1);
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Graustufen-Reproduktion für Scanrestaurierung.
+ *
+ * Das ist absichtlich KEINE harte Binarisierung. Notenlinien aus Fotos haben
+ * nach Perspektivkorrektur und Entzerrung natürliche Zwischenwerte an den
+ * Kanten. Wenn wir diese Kanten auf 0/255 zwingen, entstehen Treppenstufen und
+ * blockige Notenköpfe. Stattdessen wird lokal das Papierweiß entfernt und die
+ * Tinte mit einer weichen S-Kurve verdichtet: Papier -> weiß, sichere Tinte ->
+ * schwarz, Kanten -> graue Antialias-Pixel.
+ */
+export function restoreGrayscaleDocument(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const w = canvas.width, h = canvas.height;
+  const ctx = canvas.getContext('2d')!;
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const out = document.createElement('canvas');
+  out.width = w; out.height = h;
+  const octx = out.getContext('2d')!;
+  const oimg = octx.createImageData(w, h);
+  const od = oimg.data;
+
+  // Lokales Papierweiß aus hohem Perzentil. Auf dem bereits normalisierten Bild
+  // ist das stabil, korrigiert aber noch Restschatten und vergilbte Ränder.
+  const bgmap = computeBgMap(canvas, 0.035);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const bg = clampNum(bgmap.at(x, y), 80, 255);
+
+      // Zuerst Papier auf Weiß normieren. Dann lokale Dunkelheit bestimmen.
+      const normalized = clampNum(lum * (250 / bg), 0, 255);
+      const localDrop = Math.max(bg - lum, 255 - normalized);
+
+      // Adaptive Rauschgrenze: je dunkler/uneinheitlicher das Papier, desto mehr
+      // Abstand braucht ein Pixel, bevor er als Tinte gilt.
+      const noiseFloor = clampNum(bg * 0.022, 5.5, 10.5);
+      const fullInk = clampNum(bg * 0.18, 34, 58);
+      let ink = smoothstep(noiseFloor, fullInk, localDrop);
+
+      // Sehr dunkle Druckkerne sicher schwarz halten, aber mit weicher Kurve.
+      const darkCore = 1 - smoothstep(70, 170, normalized);
+      ink = Math.max(ink, darkCore * 0.98);
+
+      // Leichte Kontrastverdichtung ohne Kanten zu binarisieren.
+      ink = Math.pow(ink, 0.78);
+      const v = Math.round(255 * (1 - ink));
+      od[i] = v; od[i + 1] = v; od[i + 2] = v; od[i + 3] = 255;
+    }
+  }
+
+  octx.putImageData(oimg, 0, 0);
+  return out;
+}
+
 type BinarizePreset = 'strict' | 'balanced' | 'sensitive';
 
 type BinarizeProfile = {
@@ -862,10 +924,10 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
       // Ausgabeformat: Seitenverhaeltnis aus Ecken-Geometrie schätzen, sonst A4-Quer/Port je Lage
       const estW = Math.max( Math.hypot(pc.corners[1][0]-pc.corners[0][0], pc.corners[1][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[3][0], pc.corners[2][1]-pc.corners[3][1]) );
       const estH = Math.max( Math.hypot(pc.corners[3][0]-pc.corners[0][0], pc.corners[3][1]-pc.corners[0][1]), Math.hypot(pc.corners[2][0]-pc.corners[1][0], pc.corners[2][1]-pc.corners[1][1]) );
-      // Nicht künstlich auf ~2400px herunterrechnen: Bei binärer Ausgabe sieht
-      // man sonst die Treppenstufen sofort. Wir bleiben nah an der realen
+      // Nicht künstlich auf ~2400px herunterrechnen: Bei restaurierter Ausgabe
+      // sieht man sonst Treppenstufen sofort. Wir bleiben nah an der realen
       // Fotoauflösung und geben ca. 25% Supersampling dazu; die finale
-      // 0/255-Binarisierung passiert erst danach.
+      // Tonwert-/Graustufenrekonstruktion passiert erst danach.
       const scaleProbe = downscale(work, 900);
       const sourceScale = work.width / scaleProbe.width;
       const restoreScale = sourceScale * 1.25;
@@ -898,28 +960,30 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
   }
 
   // 5. Illuminations-Normalisierung je Halbseite + finale lokale
-  // Schwarz-Weiss-Separation. Binarisierung kommt bewusst NACH allen
-  // geometrischen Resamplings: So entstehen keine grauen Rotations-/Warp-Kanten
-  // im Endergebnis. Das PDF bekommt danach echte 0/255-Pixel als PNG.
+  // Graustufen-Reproduktion. Keine harte Binarisierung als Ausgabe: Die
+  // Anti-Alias-Kanten bleiben erhalten, dadurch verschwinden die blockigen
+  // Treppenstufen an Notenlinien und Schrift.
   const results: RestoredPage[] = [];
   halves.forEach((hc, idx) => {
     const norm = normalizeIllumination(hc);
     if (idx === 0) debug.stageImages.push({ label: 'Schatten entfernt', dataUrl: downscale(norm, 700).toDataURL('image/jpeg', 0.75) });
 
-    // Diagnose: drei lokale SW-Kandidaten auf verkleinerter Kopie. So können
-    // Mensch und Agent sofort sehen, ob das Problem "zu viel Dreck" oder
-    // "zu wenig Tinte" ist, ohne dreimal die volle Seite zu rechnen.
+    // Diagnose: harte SW-Kandidaten bleiben nur als Vergleich sichtbar. Die
+    // Ausgabe selbst ist Graustufe, weil harte 0/255-Kanten bei Fotos pixelig
+    // wirken und musikalische Rundungen zerstören.
     if (idx === 0) {
       const prev = downscale(norm, 1200);
+      const grayPrev = restoreGrayscaleDocument(prev);
+      debug.stageImages.push({ label: 'Graustufen-Kandidat (lokal tonwertkorrigiert)', dataUrl: grayPrev.toDataURL('image/png') });
       for (const preset of ['strict', 'balanced', 'sensitive'] as const) {
         const cand = binarizeMusicDocument(prev, preset);
-        debug.stageImages.push({ label: `SW-Kandidat ${preset}`, dataUrl: cand.toDataURL('image/png') });
+        debug.stageImages.push({ label: `SW-Vergleich ${preset}`, dataUrl: cand.toDataURL('image/png') });
       }
     }
 
-    const bw = binarizeMusicDocument(norm, 'balanced');
-    if (idx === 0) debug.stageImages.push({ label: 'Schwarz-Weiß AUSGABE (balanced, echte 0/255-Pixel)', dataUrl: downscale(bw, 700, true).toDataURL('image/png') });
-    results.push({ canvas: bw, debug });
+    const gray = restoreGrayscaleDocument(norm);
+    if (idx === 0) debug.stageImages.push({ label: 'Graustufen AUSGABE (anti-aliased)', dataUrl: downscale(gray, 700, true).toDataURL('image/png') });
+    results.push({ canvas: gray, debug });
   });
   return results;
 }

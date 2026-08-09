@@ -509,8 +509,8 @@ export default function App() {
       for (let p = 0; p < restored.length; p++) {
         if (p > 0) pdf.addPage();
         const c = restored[p].canvas;
-        // App 2 erzeugt echte Schwarz-Weiss-Seiten. Deshalb PNG statt JPEG:
-        // JPEG würde wieder Graukanten/Artefakte einführen.
+        // App 2 erzeugt restaurierte Graustufen-Seiten mit Anti-Alias-Kanten.
+        // PNG vermeidet zusätzliche JPEG-Artefakte in Schrift und Notenlinien.
         const dataUrl = c.toDataURL('image/png');
         // Seite einmessen in Inhaltsbereich (zentriert)
         const scale = Math.min(contentW / (c.width / 3.78), contentH / (c.height / 3.78)); // grob
