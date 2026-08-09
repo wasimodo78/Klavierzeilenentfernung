@@ -836,24 +836,22 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
 
   // 3. Geometrie: Prediktiv-Spur-Gitter (Innen nach aussen) zuerst; Kontur-Fallback.
   const trackGrid = estimateTrackGrid(work);
-  if (trackGrid.coverage >= 0.4 && trackGrid.staves.length >= 2) {
+  // Spur-Entwölbung nur verwenden, wenn wirklich ein nennenswertes Seiten-Gitter
+  // erkannt wurde. 1-2 zufällig getrackte Staffeln würden sonst die ganze Seite
+  // auf wenige Notenzeilen zusammendrücken (bei Handyfotos katastrophal).
+  if (trackGrid.coverage >= 0.4 && trackGrid.staves.length >= 4) {
     debug.stageImages.push({ label: `Spur-Gitter (${trackGrid.staves.length} Staffeln, Spatium ${trackGrid.spatiumPx.toFixed(1)}px, Abdeckung ${(trackGrid.coverage * 100).toFixed(0)}%)`, dataUrl: trackGrid.overlay ? trackGrid.overlay.toDataURL('image/jpeg', 0.75) : '' });
     work = dewarpByTracks(work, trackGrid);
     debug.stageImages.push({ label: 'Entwölbt (Spur)', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
   } else {
     debug.splitEvidence += `[kein Spur-Gitter: ${trackGrid.reason || 'unbekannt'}] `;
 
-    // Für Handyfotos zuerst die dominante Hauptseite isolieren. Der alte
-    // Kontur-Fallback nimmt bei Buchfotos sonst gern die komplette helle
-    // Doppelseite inklusive Tisch/zweiter Seite.
-    const runPage = detectDominantPageCornersByRuns(work);
-    let pc = runPage;
-    let contourSource: 'Hauptseite' | 'Kontur' = 'Hauptseite';
-    if (!pc.corners) {
-      debug.splitEvidence += `[Hauptseite nicht sicher: ${runPage.evidence}] `;
-      pc = detectPageCorners(work);
-      contourSource = 'Kontur';
-    }
+    // Perspektive nur über die grobe Papierkontur: Die eigentliche Buchfoto-
+    // Bereinigung (linke Nebenseite/Falz/Tisch) passiert später als Maske. Eine
+    // aggressive Hauptseiten-Homographie kann bei sichtbarer Doppelseite Musik
+    // am rechten Rand abschneiden.
+    const pc = detectPageCorners(work);
+    const contourSource: 'Kontur' = 'Kontur';
 
     if (pc.corners) {
       // Rahmen-Kopie erkennen: Alle Ecken nahe am Bildrand -> Homographie ~Identitaet.
