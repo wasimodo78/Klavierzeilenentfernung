@@ -1230,8 +1230,10 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
   // auf wenige Notenzeilen zusammendrücken (bei Handyfotos katastrophal).
   if (trackGrid.coverage >= 0.4 && trackGrid.staves.length >= 4) {
     debug.stageImages.push({ label: `Spur-Gitter (${trackGrid.staves.length} Staffeln, Spatium ${trackGrid.spatiumPx.toFixed(1)}px, Abdeckung ${(trackGrid.coverage * 100).toFixed(0)}%)`, dataUrl: trackGrid.overlay ? trackGrid.overlay.toDataURL('image/jpeg', 0.75) : '' });
-    work = dewarpByTracks(work, trackGrid);
-    debug.stageImages.push({ label: 'Entwölbt (Spur)', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
+    const straight = straightenStaffBands(work, trackGrid);
+    work = straight.canvas;
+    debug.splitEvidence += `[${straight.evidence}] `;
+    debug.stageImages.push({ label: 'Entwölbt lokal (layout-erhaltend)', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
   } else {
     debug.splitEvidence += `[kein Spur-Gitter: ${trackGrid.reason || 'unbekannt'}] `;
 
@@ -1267,6 +1269,29 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: Sc
     } else {
       debug.splitEvidence += `Kontur nicht sicher (${pc.evidence}). `;
     }
+  }
+
+  // Nach Perspektivkorrektur erst eine robuste, layout-erhaltende Spalten-
+  // Entwölbung versuchen. Sie braucht kein vollständiges Staff-Gitter und hilft
+  // gegen Buchwölbung/Treppeneffekte.
+  const beforeColStraight = work;
+  const colStraight = straightenByColumnProjection(work);
+  work = colStraight.canvas;
+  debug.splitEvidence += `[${colStraight.evidence}] `;
+  if (colStraight.canvas !== beforeColStraight) debug.stageImages.push({ label: 'Entwölbt per Spaltenprojektion', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
+
+  // Danach erneut Staff-Linien suchen: hier sind die Linien wesentlich stabiler
+  // als im rohen Handyfoto. Nur wenn genug Staffeln gefunden wurden, lokal und
+  // layout-erhaltend entwölben.
+  const postGrid = estimateTrackGrid(work);
+  if (postGrid.coverage >= 0.35 && postGrid.staves.length >= 4) {
+    debug.stageImages.push({ label: `Post-Gitter (${postGrid.staves.length} Staffeln, Spatium ${postGrid.spatiumPx.toFixed(1)}px)`, dataUrl: postGrid.overlay ? postGrid.overlay.toDataURL('image/jpeg', 0.75) : '' });
+    const straight = straightenStaffBands(work, postGrid);
+    work = straight.canvas;
+    debug.splitEvidence += `[post ${straight.evidence}] `;
+    debug.stageImages.push({ label: 'Entwölbt lokal nach Perspektive', dataUrl: downscale(work, 700).toDataURL('image/jpeg', 0.75) });
+  } else {
+    debug.splitEvidence += `[kein Post-Gitter: ${postGrid.reason || `${postGrid.staves.length} Staffeln, Abdeckung ${(postGrid.coverage * 100).toFixed(0)}%`}] `;
   }
 
   // 4. Doppelseiten-Erkennung auf dem entzerrten Bild
@@ -1784,4 +1809,224 @@ export function dewarpByTracks(canvas: HTMLCanvasElement, grid: GridResult): HTM
     return big;
   }
   return out;
+}
+
+// Layout-erhaltende lokale Staff-Entwölbung: Anders als dewarpByTracks() wird
+// die Seite NICHT auf ein neues Notenraster zusammengedrückt. Stattdessen werden
+// nur lokale Y-Verschiebungen in der Nähe erkannter Stafflinien angewandt, sodass
+// gekrümmte Linien an ihrer vorhandenen Seitenposition geglättet werden.
+export function straightenStaffBands(canvas: HTMLCanvasElement, grid: GridResult): { canvas: HTMLCanvasElement; evidence: string } {
+  if (!grid.overlay || grid.staves.length < 4 || grid.spatiumPx <= 0) {
+    return { canvas, evidence: `kein lokales Entwölben (staves=${grid.staves.length}, sp=${grid.spatiumPx.toFixed(1)})` };
+  }
+
+  const W = canvas.width, H = canvas.height;
+  const smallW = grid.overlay.width, smallH = grid.overlay.height;
+  const sx = W / smallW, sy = H / smallH;
+  const sp = grid.spatiumPx * sy;
+  const cx = smallW / 2;
+
+  type RowRef = { targetY: number; startX: number; endX: number; deltaAt: (xSmall: number) => number };
+  const rows: RowRef[] = [];
+  for (const st of grid.staves) {
+    for (const t of st.rows) {
+      const midX = clampNum(cx, t.startX, t.endX);
+      const targetY = t.evalAtSafe(midX) * sy;
+      rows.push({
+        targetY,
+        startX: Math.max(0, t.startX - grid.spatiumPx * 5),
+        endX: Math.min(smallW - 1, t.endX + grid.spatiumPx * 5),
+        deltaAt: (xSmall: number) => (t.evalAtSafe(xSmall) * sy) - targetY,
+      });
+    }
+  }
+  rows.sort((a, b) => a.targetY - b.targetY);
+  if (rows.length < 20) return { canvas, evidence: `zu wenige Staff-Zeilen (${rows.length})` };
+
+  const maxAbsDelta = sp * 2.2;
+  const bandRadius = sp * 2.4;
+  const sigma = sp * 0.95;
+  const sctx = canvas.getContext('2d')!;
+  const src = sctx.getImageData(0, 0, W, H);
+  const sd = src.data;
+  const out = document.createElement('canvas');
+  out.width = W; out.height = H;
+  const octx = out.getContext('2d')!;
+  const oimg = octx.createImageData(W, H);
+  const od = oimg.data;
+
+  const sample = (x: number, y: number): [number, number, number] => {
+    const yy = clampNum(y, 0, H - 1);
+    const y0 = Math.floor(yy), y1 = Math.min(H - 1, y0 + 1);
+    const dy = yy - y0;
+    const i0 = (y0 * W + x) * 4;
+    const i1 = (y1 * W + x) * 4;
+    return [
+      sd[i0] * (1 - dy) + sd[i1] * dy,
+      sd[i0 + 1] * (1 - dy) + sd[i1 + 1] * dy,
+      sd[i0 + 2] * (1 - dy) + sd[i1 + 2] * dy,
+    ];
+  };
+
+  let correctedRows = 0;
+  for (let y = 0; y < H; y++) {
+    const candidates = rows.filter(r => Math.abs(r.targetY - y) <= bandRadius);
+    if (candidates.length === 0) {
+      od.set(sd.subarray(y * W * 4, (y + 1) * W * 4), y * W * 4);
+      continue;
+    }
+    correctedRows++;
+    for (let x = 0; x < W; x++) {
+      const xSmall = x / sx;
+      let sumW = 0;
+      let sumD = 0;
+      for (const r of candidates) {
+        if (xSmall < r.startX || xSmall > r.endX) continue;
+        const dist = y - r.targetY;
+        const wt = Math.exp(-(dist * dist) / (2 * sigma * sigma));
+        if (wt < 0.005) continue;
+        sumW += wt;
+        sumD += wt * clampNum(r.deltaAt(xSmall), -maxAbsDelta, maxAbsDelta);
+      }
+      const dst = (y * W + x) * 4;
+      if (sumW <= 0) {
+        const srcIdx = dst;
+        od[dst] = sd[srcIdx]; od[dst + 1] = sd[srcIdx + 1]; od[dst + 2] = sd[srcIdx + 2]; od[dst + 3] = 255;
+      } else {
+        const delta = sumD / sumW;
+        const [r, g, b] = sample(x, y + delta);
+        od[dst] = r; od[dst + 1] = g; od[dst + 2] = b; od[dst + 3] = 255;
+      }
+    }
+  }
+
+  octx.putImageData(oimg, 0, 0);
+  return { canvas: out, evidence: `lokal entwölbt: ${grid.staves.length} Staffeln/${rows.length} Zeilen, ${correctedRows} Bildzeilen korrigiert, sp=${sp.toFixed(1)}px` };
+}
+
+// Layout-erhaltende Seitenentwölbung über Spalten-Projektionen. Für jede
+// vertikale Bildspalte/Strip wird gemessen, um wie viele Pixel die horizontalen
+// Stafflinien gegenüber dem globalen Referenzprofil nach oben/unten verschoben
+// sind. Dann wird nur eine sanfte Y-Verschiebung pro X angewandt. Das ist keine
+// Notenraster-Kompression und kann schon helfen, lokale Buchwölbung/Treppen zu
+// reduzieren, wenn die volle Staff-Track-Erkennung noch nicht stabil genug ist.
+export function straightenByColumnProjection(canvas: HTMLCanvasElement): { canvas: HTMLCanvasElement; evidence: string } {
+  const pixels = canvas.width * canvas.height;
+  // Vollauflösende Spalten-Warps brauchen mehrere große RGBA-Puffer. In der
+  // aktuellen Browser/Sandbox-Speichergrenze nur auf kleineren Seiten aktivieren;
+  // sonst sicher überspringen statt die App zu killen.
+  if (pixels > 10_000_000) return { canvas, evidence: `Spalten-Entwölbung übersprungen (Speicherschutz ${(pixels / 1_000_000).toFixed(1)}MP)` };
+  const small = downscale(canvas, 1000, true);
+  const w = small.width, h = small.height;
+  const bin = closeH(binarizeAdaptive(small, 0.05, 0.64), w, h, 3);
+  const stripCount = clampNum(Math.round(w / 38), 14, 40);
+  const stripW = w / stripCount;
+  const profiles: Float64Array[] = [];
+  const ref = new Float64Array(h);
+
+  for (let s = 0; s < stripCount; s++) {
+    const x0 = Math.floor(s * stripW);
+    const x1 = Math.min(w - 1, Math.floor((s + 1) * stripW) - 1);
+    const prof = new Float64Array(h);
+    for (let y = 0; y < h; y++) {
+      let c = 0;
+      const off = y * w;
+      for (let x = x0; x <= x1; x++) if (bin[off + x]) c++;
+      prof[y] = c;
+      ref[y] += c;
+    }
+    profiles.push(prof);
+  }
+
+  // Vertikal glätten: Projektionsspitzen bleiben, Noten-/Textsalz wird ruhiger.
+  const smooth = (arr: Float64Array, rad = 2): Float64Array => {
+    const out = new Float64Array(arr.length);
+    for (let i = 0; i < arr.length; i++) {
+      let s = 0, n = 0;
+      for (let k = -rad; k <= rad; k++) {
+        const j = i + k;
+        if (j >= 0 && j < arr.length) { s += arr[j]; n++; }
+      }
+      out[i] = s / Math.max(1, n);
+    }
+    return out;
+  };
+  const refS = smooth(ref, 2);
+  const maxShift = Math.max(6, Math.round(h * 0.035));
+  const shiftsSmall: number[] = [];
+  const strengths: number[] = [];
+
+  for (const prof0 of profiles) {
+    const prof = smooth(prof0, 2);
+    let bestD = 0;
+    let bestScore = -Infinity;
+    let zeroScore = 0;
+    for (let d = -maxShift; d <= maxShift; d++) {
+      let score = 0;
+      for (let y = Math.max(0, -d); y < Math.min(h, h - d); y++) {
+        score += prof[y + d] * refS[y];
+      }
+      if (d === 0) zeroScore = score;
+      if (score > bestScore) { bestScore = score; bestD = d; }
+    }
+    // Schwache/unklare Spalten nicht überkorrigieren.
+    const strength = zeroScore > 0 ? bestScore / zeroScore : 1;
+    shiftsSmall.push(strength > 1.015 ? bestD : 0);
+    strengths.push(strength);
+  }
+
+  // Robust glätten, damit keine Strip-Kanten entstehen.
+  const smoothShifts = shiftsSmall.map((_, i) => {
+    const vals: number[] = [];
+    for (let k = -2; k <= 2; k++) {
+      const j = clampNum(i + k, 0, stripCount - 1);
+      vals.push(shiftsSmall[j]);
+    }
+    vals.sort((a, b) => a - b);
+    return vals[Math.floor(vals.length / 2)];
+  });
+  const avgAbs = smoothShifts.reduce((s, v) => s + Math.abs(v), 0) / smoothShifts.length;
+  if (avgAbs < 0.35) return { canvas, evidence: `Spalten-Entwölbung übersprungen (avgShift=${avgAbs.toFixed(2)}px)` };
+
+  const W = canvas.width, H = canvas.height;
+  const scaleY = H / h;
+  const out = document.createElement('canvas');
+  out.width = W; out.height = H;
+  const sctx = canvas.getContext('2d')!;
+  const src = sctx.getImageData(0, 0, W, H);
+  const sd = src.data;
+  const octx = out.getContext('2d')!;
+  const oimg = octx.createImageData(W, H);
+  const od = oimg.data;
+
+  const shiftAtX = (x: number): number => {
+    const pos = (x / W) * stripCount - 0.5;
+    const i0 = clampNum(Math.floor(pos), 0, stripCount - 1);
+    const i1 = clampNum(i0 + 1, 0, stripCount - 1);
+    const t = clampNum(pos - i0, 0, 1);
+    return (smoothShifts[i0] * (1 - t) + smoothShifts[i1] * t) * scaleY;
+  };
+  const sample = (x: number, y: number): [number, number, number] => {
+    const yy = clampNum(y, 0, H - 1);
+    const y0 = Math.floor(yy), y1 = Math.min(H - 1, y0 + 1);
+    const dy = yy - y0;
+    const i0 = (y0 * W + x) * 4;
+    const i1 = (y1 * W + x) * 4;
+    return [
+      sd[i0] * (1 - dy) + sd[i1] * dy,
+      sd[i0 + 1] * (1 - dy) + sd[i1 + 1] * dy,
+      sd[i0 + 2] * (1 - dy) + sd[i1 + 2] * dy,
+    ];
+  };
+
+  for (let x = 0; x < W; x++) {
+    const sh = clampNum(shiftAtX(x), -maxShift * scaleY, maxShift * scaleY);
+    for (let y = 0; y < H; y++) {
+      const [r, g, b] = sample(x, y + sh);
+      const i = (y * W + x) * 4;
+      od[i] = r; od[i + 1] = g; od[i + 2] = b; od[i + 3] = 255;
+    }
+  }
+  octx.putImageData(oimg, 0, 0);
+  return { canvas: out, evidence: `Spalten-Entwölbung avg=${avgAbs.toFixed(2)}px max=${Math.max(...smoothShifts.map(v => Math.abs(v))).toFixed(1)}px strips=${stripCount}` };
 }

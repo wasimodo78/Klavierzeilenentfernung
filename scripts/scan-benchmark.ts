@@ -1,5 +1,5 @@
 import { createCanvas, loadImage, Image } from '@napi-rs/canvas';
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   downscale,
@@ -155,7 +155,7 @@ function makeOutDir(input: string): string {
 }
 
 async function loadInputCanvas(input: string): Promise<HTMLCanvasElement> {
-  const img = await loadImage(input);
+  const img = await loadImage(readFileSync(path.resolve(input)));
   const canvas = createCanvas(img.width, img.height) as unknown as HTMLCanvasElement;
   canvas.getContext('2d')!.drawImage(img as any, 0, 0);
   return canvas;
@@ -167,7 +167,7 @@ async function contactSheet(results: VariantResult[], outDir: string) {
   const labelH = 92;
   const cols = Math.min(2, results.length);
   const thumbs = await Promise.all(results.map(async r => {
-    const img = await loadImage(path.join(outDir, r.file));
+    const img = await loadImage(readFileSync(path.join(outDir, r.file)));
     const scale = thumbW / img.width;
     return { img, w: thumbW, h: Math.round(img.height * scale), r };
   }));
