@@ -712,7 +712,60 @@ function smoothstep(edge0: number, edge1: number, x: number): number {
  * Tinte mit einer weichen S-Kurve verdichtet: Papier -> weiß, sichere Tinte ->
  * schwarz, Kanten -> graue Antialias-Pixel.
  */
-export function restoreGrayscaleDocument(canvas: HTMLCanvasElement): HTMLCanvasElement {
+export type GrayscaleProfile = {
+  name: string;
+  noiseFloorFrac: number;
+  noiseFloorMin: number;
+  noiseFloorMax: number;
+  fullInkFrac: number;
+  fullInkMin: number;
+  fullInkMax: number;
+  gamma: number;
+  darkCoreLow: number;
+  darkCoreHigh: number;
+};
+
+export const GRAYSCALE_PROFILES = {
+  soft: {
+    name: 'soft',
+    noiseFloorFrac: 0.018, noiseFloorMin: 4.5, noiseFloorMax: 9.0,
+    fullInkFrac: 0.24, fullInkMin: 42, fullInkMax: 72,
+    gamma: 0.92, darkCoreLow: 55, darkCoreHigh: 150,
+  },
+  balanced: {
+    name: 'balanced',
+    noiseFloorFrac: 0.022, noiseFloorMin: 5.5, noiseFloorMax: 10.5,
+    fullInkFrac: 0.18, fullInkMin: 34, fullInkMax: 58,
+    gamma: 0.78, darkCoreLow: 70, darkCoreHigh: 170,
+  },
+  crisp: {
+    name: 'crisp',
+    noiseFloorFrac: 0.026, noiseFloorMin: 6.5, noiseFloorMax: 12.0,
+    fullInkFrac: 0.145, fullInkMin: 28, fullInkMax: 48,
+    gamma: 0.66, darkCoreLow: 78, darkCoreHigh: 178,
+  },
+  inkRich: {
+    name: 'inkRich',
+    noiseFloorFrac: 0.020, noiseFloorMin: 5.0, noiseFloorMax: 9.5,
+    fullInkFrac: 0.15, fullInkMin: 28, fullInkMax: 50,
+    gamma: 0.58, darkCoreLow: 82, darkCoreHigh: 182,
+  },
+} satisfies Record<string, GrayscaleProfile>;
+
+export type GrayscaleProfileName = keyof typeof GRAYSCALE_PROFILES;
+
+export type ScanRestoreOptions = {
+  grayscaleProfile?: GrayscaleProfileName | GrayscaleProfile;
+  includeComparisonStages?: boolean;
+};
+
+function resolveGrayscaleProfile(profile: GrayscaleProfileName | GrayscaleProfile | undefined): GrayscaleProfile {
+  if (!profile) return GRAYSCALE_PROFILES.balanced;
+  return typeof profile === 'string' ? GRAYSCALE_PROFILES[profile] : profile;
+}
+
+export function restoreGrayscaleDocument(canvas: HTMLCanvasElement, profileInput?: GrayscaleProfileName | GrayscaleProfile): HTMLCanvasElement {
+  const profile = resolveGrayscaleProfile(profileInput);
   const w = canvas.width, h = canvas.height;
   const ctx = canvas.getContext('2d')!;
   const img = ctx.getImageData(0, 0, w, h);
@@ -733,22 +786,30 @@ export function restoreGrayscaleDocument(canvas: HTMLCanvasElement): HTMLCanvasE
       const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
       const bg = clampNum(bgmap.at(x, y), 80, 255);
 
-      // Zuerst Papier auf Weiß normieren. Dann lokale Dunkelheit bestimmen.
+      // Zuerst Papier auf Weiß normieren. Entscheidend ist danach NICHT jede
+      // kleine Helligkeitsdelle im Papier, sondern nur Dunkelheit, die auch nach
+      // lokaler Weißpunktkorrektur noch wie Druck aussieht.
       const normalized = clampNum(lum * (250 / bg), 0, 255);
-      const localDrop = Math.max(bg - lum, 255 - normalized);
+      const localDrop = bg - lum;
 
       // Adaptive Rauschgrenze: je dunkler/uneinheitlicher das Papier, desto mehr
-      // Abstand braucht ein Pixel, bevor er als Tinte gilt.
-      const noiseFloor = clampNum(bg * 0.022, 5.5, 10.5);
-      const fullInk = clampNum(bg * 0.18, 34, 58);
-      let ink = smoothstep(noiseFloor, fullInk, localDrop);
+      // Abstand braucht ein Pixel, bevor er als Tinte gelten darf.
+      const noiseFloor = clampNum(bg * profile.noiseFloorFrac, profile.noiseFloorMin, profile.noiseFloorMax);
+      const fullInk = clampNum(bg * profile.fullInkFrac, profile.fullInkMin, profile.fullInkMax);
+      const contrastInk = smoothstep(noiseFloor, fullInk, localDrop);
+
+      // Schatten/Falten können lokal ebenfalls "dunkler als Papier" sein. Sie
+      // bleiben aber nach Weißpunktkorrektur relativ hell. Dieses Gate verhindert,
+      // dass Papierstruktur zu schwarzer Tinte hochgezogen wird.
+      const printDarkGate = 1 - smoothstep(188, 238, normalized);
+      let ink = contrastInk * printDarkGate;
 
       // Sehr dunkle Druckkerne sicher schwarz halten, aber mit weicher Kurve.
-      const darkCore = 1 - smoothstep(70, 170, normalized);
+      const darkCore = 1 - smoothstep(profile.darkCoreLow, profile.darkCoreHigh, normalized);
       ink = Math.max(ink, darkCore * 0.98);
 
       // Leichte Kontrastverdichtung ohne Kanten zu binarisieren.
-      ink = Math.pow(ink, 0.78);
+      ink = Math.pow(clampNum(ink, 0, 1), profile.gamma);
       const v = Math.round(255 * (1 - ink));
       od[i] = v; od[i + 1] = v; od[i + 2] = v; od[i + 3] = 255;
     }
@@ -860,10 +921,12 @@ export function binarizeMusicDocument(canvas: HTMLCanvasElement, preset: Binariz
   return drawBilevelCanvas(cleaned, w, h);
 }
 
-export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<RestoredPage[]> {
+export async function restoreScanImage(srcCanvas: HTMLCanvasElement, options: ScanRestoreOptions = {}): Promise<RestoredPage[]> {
   const debug: ScanDebug = {
     orientationVotes: '', fineAngleDeg: 0, split: 'einseitig', splitColumnX: null, splitEvidence: '', stageImages: []
   };
+  const grayscaleProfile = resolveGrayscaleProfile(options.grayscaleProfile);
+  const includeComparisonStages = options.includeComparisonStages ?? true;
 
   debug.stageImages.push({ label: 'Original', dataUrl: downscale(srcCanvas, 700).toDataURL('image/jpeg', 0.75) });
 
@@ -971,18 +1034,20 @@ export async function restoreScanImage(srcCanvas: HTMLCanvasElement): Promise<Re
     // Diagnose: harte SW-Kandidaten bleiben nur als Vergleich sichtbar. Die
     // Ausgabe selbst ist Graustufe, weil harte 0/255-Kanten bei Fotos pixelig
     // wirken und musikalische Rundungen zerstören.
-    if (idx === 0) {
+    if (idx === 0 && includeComparisonStages) {
       const prev = downscale(norm, 1200);
-      const grayPrev = restoreGrayscaleDocument(prev);
-      debug.stageImages.push({ label: 'Graustufen-Kandidat (lokal tonwertkorrigiert)', dataUrl: grayPrev.toDataURL('image/png') });
+      for (const profileName of Object.keys(GRAYSCALE_PROFILES) as GrayscaleProfileName[]) {
+        const grayPrev = restoreGrayscaleDocument(prev, profileName);
+        debug.stageImages.push({ label: `Graustufen-Kandidat ${profileName}`, dataUrl: grayPrev.toDataURL('image/png') });
+      }
       for (const preset of ['strict', 'balanced', 'sensitive'] as const) {
         const cand = binarizeMusicDocument(prev, preset);
         debug.stageImages.push({ label: `SW-Vergleich ${preset}`, dataUrl: cand.toDataURL('image/png') });
       }
     }
 
-    const gray = restoreGrayscaleDocument(norm);
-    if (idx === 0) debug.stageImages.push({ label: 'Graustufen AUSGABE (anti-aliased)', dataUrl: downscale(gray, 700, true).toDataURL('image/png') });
+    const gray = restoreGrayscaleDocument(norm, grayscaleProfile);
+    if (idx === 0) debug.stageImages.push({ label: `Graustufen AUSGABE (${grayscaleProfile.name}, anti-aliased)`, dataUrl: downscale(gray, 700, true).toDataURL('image/png') });
     results.push({ canvas: gray, debug });
   });
   return results;
