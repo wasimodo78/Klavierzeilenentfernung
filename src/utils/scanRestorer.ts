@@ -776,39 +776,74 @@ export function restoreGrayscaleDocument(canvas: HTMLCanvasElement, profileInput
   const oimg = octx.createImageData(w, h);
   const od = oimg.data;
 
+  const lumArr = new Uint8Array(w * h);
+  const stride = w + 1;
+  const integral = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    const dst = (y + 1) * stride;
+    const prev = y * stride;
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const l = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+      lumArr[y * w + x] = l;
+      row += l;
+      integral[dst + x + 1] = integral[prev + x + 1] + row;
+    }
+  }
+
   // Lokales Papierweiß aus hohem Perzentil. Auf dem bereits normalisierten Bild
   // ist das stabil, korrigiert aber noch Restschatten und vergilbte Ränder.
   const bgmap = computeBgMap(canvas, 0.035);
 
+  // Kleine Hochpass-Nachbarschaft: Druck ist kleinteilig (Notenlinien, Schrift,
+  // Notenköpfe), Papierfalten/Schatten sind breitflächig. Genau diese Trennung
+  // fehlte vorher und hat Falten als Tinte verstärkt.
+  const detailR = Math.max(5, Math.min(28, Math.round(Math.min(w, h) * 0.0045)));
+  const localMeanAt = (x: number, y: number): number => {
+    const x0 = Math.max(0, x - detailR), x1 = Math.min(w - 1, x + detailR);
+    const y0 = Math.max(0, y - detailR), y1 = Math.min(h - 1, y + detailR);
+    const area = (x1 - x0 + 1) * (y1 - y0 + 1);
+    const a = y0 * stride + x0;
+    const b = y0 * stride + x1 + 1;
+    const c = (y1 + 1) * stride + x0;
+    const e = (y1 + 1) * stride + x1 + 1;
+    return (integral[e] - integral[c] - integral[b] + integral[a]) / area;
+  };
+
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
-      const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const lum = lumArr[y * w + x];
       const bg = clampNum(bgmap.at(x, y), 80, 255);
 
-      // Zuerst Papier auf Weiß normieren. Entscheidend ist danach NICHT jede
-      // kleine Helligkeitsdelle im Papier, sondern nur Dunkelheit, die auch nach
-      // lokaler Weißpunktkorrektur noch wie Druck aussieht.
+      // Papierweiß normieren, aber Tinte primär über lokale Detaildunkelheit
+      // erkennen. Breite Falten können viel bg-lum haben, aber wenig DetailDrop.
       const normalized = clampNum(lum * (250 / bg), 0, 255);
-      const localDrop = bg - lum;
+      const detailMean = localMeanAt(x, y);
+      const detailDrop = Math.max(0, detailMean - lum);
+      const broadDrop = Math.max(0, bg - lum);
 
-      // Adaptive Rauschgrenze: je dunkler/uneinheitlicher das Papier, desto mehr
-      // Abstand braucht ein Pixel, bevor er als Tinte gelten darf.
       const noiseFloor = clampNum(bg * profile.noiseFloorFrac, profile.noiseFloorMin, profile.noiseFloorMax);
       const fullInk = clampNum(bg * profile.fullInkFrac, profile.fullInkMin, profile.fullInkMax);
-      const contrastInk = smoothstep(noiseFloor, fullInk, localDrop);
+      const detailFullInk = clampNum(fullInk * 0.58, 16, 38);
+      const detailInk = smoothstep(noiseFloor * 0.72, detailFullInk, detailDrop);
 
-      // Schatten/Falten können lokal ebenfalls "dunkler als Papier" sein. Sie
-      // bleiben aber nach Weißpunktkorrektur relativ hell. Dieses Gate verhindert,
-      // dass Papierstruktur zu schwarzer Tinte hochgezogen wird.
-      const printDarkGate = 1 - smoothstep(188, 238, normalized);
-      let ink = contrastInk * printDarkGate;
+      // Antialias-Kanten liegen oft knapp unter dem Detail-Gate. Ein schwacher
+      // Breitkontrast darf nur helfen, wenn auch lokaler Hochpass-Kontrast da ist.
+      const broadAssist = smoothstep(noiseFloor * 1.4, fullInk * 1.1, broadDrop) *
+        smoothstep(noiseFloor * 0.45, detailFullInk * 0.8, detailDrop);
 
-      // Sehr dunkle Druckkerne sicher schwarz halten, aber mit weicher Kurve.
-      const darkCore = 1 - smoothstep(profile.darkCoreLow, profile.darkCoreHigh, normalized);
+      // Schatten/Falten bleiben nach Weißpunktkorrektur relativ hell.
+      const printDarkGate = 1 - smoothstep(190, 240, normalized);
+      let ink = Math.max(detailInk, broadAssist * 0.55) * printDarkGate;
+
+      // Sehr dunkle Druckkerne sichern, aber nur wenn sie lokal kleinteiligen
+      // Kontrast haben. Das verhindert schwarze Faltenflächen.
+      const darkCore = (1 - smoothstep(profile.darkCoreLow, profile.darkCoreHigh, normalized)) *
+        smoothstep(noiseFloor * 0.35, detailFullInk * 0.75, detailDrop);
       ink = Math.max(ink, darkCore * 0.98);
 
-      // Leichte Kontrastverdichtung ohne Kanten zu binarisieren.
       ink = Math.pow(clampNum(ink, 0, 1), profile.gamma);
       const v = Math.round(255 * (1 - ink));
       od[i] = v; od[i + 1] = v; od[i + 2] = v; od[i + 3] = 255;

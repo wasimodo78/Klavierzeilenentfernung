@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# App-2 generated scan diagnostics can be large. Commit curated summaries only.
+debug_scan/agent_bench_*/
+debug_scan/scan_*/
