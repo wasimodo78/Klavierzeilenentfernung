@@ -1,12 +1,15 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { jsPDF } from 'jspdf';
+import workerUrl from 'pdfjs-dist/build/pdf.worker.min.js?url';
 
-// Set the worker source to the CDN to avoid Vite bundling issues with web workers
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+// Bundle the pdf.js worker locally so the app works fully offline (no CDN needed).
+pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
 
 type Region = { start: number; end: number; type: 'ink' | 'gap' };
 
-export type ExtractedSystem = { dataUrl: string; width: number; height: number };
+export type ExtractedSystem = { dataUrl: string; width: number; height: number; widthMm?: number; heightMm?: number; newPiece?: boolean };
+
+export type PlacedSystem = { img: ExtractedSystem; wMm: number; hMm: number; xMm: number };
 
 export async function extractSystems(
   file: File,
@@ -282,28 +285,52 @@ export const PAGE_LAYOUT = {
   GAP_MM: 8
 };
 
-export function groupSystemsIntoPages(images: ExtractedSystem[]): ExtractedSystem[][] {
-  const { A4_HEIGHT_MM, MARGIN_MM, GAP_MM, A4_WIDTH_MM } = PAGE_LAYOUT;
-  const CONTENT_WIDTH_MM = A4_WIDTH_MM - 2 * MARGIN_MM;
+/**
+ * Platzmaße eines Systems: Originalgröße beibehalten (nie über 100% – sonst
+ * passen weniger Systeme pro Seite und die Größen werden inkonsistent).
+ * Nur verkleinern, wenn der Inhalt tatsächlich breiter/höher als die Seite ist.
+ * Alte Streifen ohne mm-Angaben werden wie bisher auf Inhaltsbreite gestreckt.
+ */
+export function layoutSize(img: ExtractedSystem): { wMm: number, hMm: number } {
+  const CONTENT_W = PAGE_LAYOUT.A4_WIDTH_MM - 2 * PAGE_LAYOUT.MARGIN_MM;
+  const CONTENT_H = PAGE_LAYOUT.A4_HEIGHT_MM - 2 * PAGE_LAYOUT.MARGIN_MM;
 
-  const pages: ExtractedSystem[][] = [[]];
+  let w = img.widthMm;
+  let h = img.heightMm;
+  if (!w || !h) {
+    w = CONTENT_W;
+    h = (img.height * CONTENT_W) / img.width;
+  }
+
+  let scale = Math.min(1, CONTENT_W / w);
+  if (h * scale > CONTENT_H) scale = CONTENT_H / h;
+  return { wMm: w * scale, hMm: h * scale };
+}
+
+export function groupSystemsIntoPages(images: ExtractedSystem[]): PlacedSystem[][] {
+  const { A4_HEIGHT_MM, MARGIN_MM, GAP_MM } = PAGE_LAYOUT;
+
+  const pages: PlacedSystem[][] = [[]];
   let currentY = MARGIN_MM;
 
   for (const img of images) {
-    let scaledHeight = (img.height * CONTENT_WIDTH_MM) / img.width;
+    const { wMm, hMm } = layoutSize(img);
 
-    // Safety check for very tall blocks (e.g. title pages)
-    if (scaledHeight > A4_HEIGHT_MM - 2 * MARGIN_MM) {
-      scaledHeight = A4_HEIGHT_MM - 2 * MARGIN_MM;
-    }
-
-    if (currentY + scaledHeight > A4_HEIGHT_MM - MARGIN_MM && currentY > MARGIN_MM) {
+    // Neues Stück (Titel mitten im Heft erkannt) -> immer neue Seite beginnen
+    if (img.newPiece && currentY > MARGIN_MM && pages[pages.length - 1].length > 0) {
       pages.push([]);
       currentY = MARGIN_MM;
     }
 
-    pages[pages.length - 1].push(img);
-    currentY += scaledHeight + GAP_MM;
+    if (currentY + hMm > A4_HEIGHT_MM - MARGIN_MM && currentY > MARGIN_MM) {
+      pages.push([]);
+      currentY = MARGIN_MM;
+    }
+
+    // Horizontal zentriert auf der Inhaltsbreite platzieren (Naturmaß bleibt)
+    const xMm = MARGIN_MM + Math.max(0, (PAGE_LAYOUT.A4_WIDTH_MM - 2 * MARGIN_MM - wMm) / 2);
+    pages[pages.length - 1].push({ img, wMm, hMm, xMm });
+    currentY += hMm + GAP_MM;
   }
 
   return pages;
@@ -330,16 +357,28 @@ export async function generatePdf(
   for (let i = 0; i < croppedImages.length; i++) {
     onProgress(`Setze System ${i + 1} von ${croppedImages.length}...`, 10 + (i / croppedImages.length) * 90);
     const img = croppedImages[i];
-    const scaledHeight = (img.height * contentWidth) / img.width;
+    // Originalgröße platzieren (siehe layoutSize)
+    const { wMm, hMm } = layoutSize(img);
 
-    if (currentY + scaledHeight > pageHeight - margin && currentY > margin) {
+    // Neues Stück -> Seitenumbruch erzwingen
+    if (img.newPiece && currentY > margin) {
       outPdf.addPage();
       currentY = margin;
       pageCount++;
     }
 
-    outPdf.addImage(img.dataUrl, 'JPEG', margin, currentY, contentWidth, scaledHeight, undefined, 'FAST');
-    currentY += scaledHeight + gap; 
+    if (currentY + hMm > pageHeight - margin && currentY > margin) {
+      outPdf.addPage();
+      currentY = margin;
+      pageCount++;
+    }
+
+    // Format aus der Data-URL erkennen (1-Bit Ausgabe kommt als PNG)
+    const imgFormat = img.dataUrl.startsWith('data:image/png') ? 'PNG' : 'JPEG';
+    // wie Vorschau: zentriert auf der Inhaltsbreite
+    const xMm = margin + Math.max(0, (contentWidth - wMm) / 2);
+    outPdf.addImage(img.dataUrl, imgFormat, xMm, currentY, wMm, hMm, undefined, 'FAST');
+    currentY += hMm + gap; 
   }
 
   onProgress("Fertig!", 100);

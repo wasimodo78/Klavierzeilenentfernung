@@ -1,10 +1,17 @@
 export async function analyzePixels(
   canvas: HTMLCanvasElement,
   onProgress: (msg: string) => void,
-  pageIndex: number = 1
-): Promise<{ debugImage: string, stats: string, croppedStrips: { dataUrl: string, height: number }[] }> {
+  pageIndex: number = 1,
+  output?: { canvas: HTMLCanvasElement; bilevel: boolean; mmPerPx?: number }
+): Promise<{ debugImage: string, stats: string, croppedStrips: { dataUrl: string, height: number, width: number, widthMm: number, heightMm: number, newPiece: boolean }[] }> {
   onProgress("Starte Bildanalyse (Binarisierung)...");
   const ctx = canvas.getContext('2d')!;
+  // Ausgabe erfolgt optional aus einem separaten hochauflösenden Render
+  const outCanvas = output?.canvas ?? canvas;
+  const outScale = outCanvas.width / canvas.width;
+  const outBilevel = output?.bilevel ?? false;
+  // echter Millimeter-Maßstab pro Analyse-Pixel (für Originalgröße im Layout)
+  const mmPerPx = output?.mmPerPx ?? (210 / canvas.width);
   const width = canvas.width;
   const height = canvas.height;
   const imgData = ctx.getImageData(0, 0, width, height);
@@ -41,6 +48,15 @@ export async function analyzePixels(
       data[i+1] = 255;
       data[i+2] = 255;
     }
+  }
+
+  // Seitenrahmen des Verlags erkennen: Spalten, die fast durchgehend schwarz sind,
+  // werden beim späteren X-Zuschnitt nicht als Inhalt gewertet.
+  const frameCols = new Uint8Array(width);
+  for (let fx = 0; fx < width; fx++) {
+    let colBlack = 0;
+    for (let fy = 0; fy < height; fy++) colBlack += binaryMap[fy * width + fx];
+    if (colBlack > height * 0.97) frameCols[fx] = 1;
   }
 
   onProgress("Suche nach Notenlinien (Run-Length)...");
@@ -382,79 +398,574 @@ export async function analyzePixels(
     }
   }
 
-  const croppedStrips: { dataUrl: string, height: number }[] = [];
+  // --- 7. Segmentbasiertes Schneiden ---
+  // Statt Akkoladen nur an den Außenkanten zu beschneiden, bilden wir aus den
+  // Nicht-Klavier-Systemen zusammenhängende Keep-Segmente. Klavier-Läufe
+  // (geschweifte Klammer) fallen so auch mitten auf der Seite als Lücke heraus –
+  // unabhängig davon, wie die Akkolade-Gruppierung ausgefallen ist.
+  const croppedStrips: { dataUrl: string, height: number, width: number, widthMm: number, heightMm: number, newPiece: boolean }[] = [];
   let keepRegionsStats = '';
-  if (akkoladen.length > 0) {
-    const globalAvgSpatium = staves.reduce((s, st) => s + st.spatium, 0) / staves.length;
-    // Exactly 5 spatiums below the lowest non-piano line as requested
-    const safeMargin = Math.floor(globalAvgSpatium * 5); 
-    const topMargin = Math.floor(globalAvgSpatium * 8); // Margin at the top of subsequent akkoladen
 
-    for (let i = 0; i < akkoladen.length; i++) {
-      const akk = akkoladen[i];
-      // Find curly brackets that vertically overlap with this akkolade
-      const akkCurlyBrackets = brackets.filter(b => b.type === 'curly' && b.minY < akk.endY && b.maxY > akk.startY);
-      
-      const bracketTolerance = globalAvgSpatium * 4;
-      
-      let keepStaves = akk.staves;
-      if (akkCurlyBrackets.length > 0) {
-        // "Schneide doch einfach alle Systeme mit der geschweiften Klammer ab."
-        // We filter out any staff that falls within the vertical bounds of a curly bracket.
-        keepStaves = akk.staves.filter(staff => {
-          const centerY = (staff.y1 + staff.y5) / 2;
-          return !akkCurlyBrackets.some(b => centerY >= b.minY - bracketTolerance && centerY <= b.maxY + bracketTolerance);
+  if (staves.length > 0) {
+    const globalAvgSpatium = staves.reduce((s, st) => s + st.spatium, 0) / staves.length;
+    const safeMargin = Math.floor(globalAvgSpatium * 5);
+    const topMargin = Math.floor(globalAvgSpatium * 8);
+    const bracketTolerance = globalAvgSpatium * 4;
+    const curlyBrackets = brackets.filter(b => b.type === 'curly');
+
+    // a) Systeme klassifizieren: Klavier = Systemmitte in geschweifter Klammer –
+    //    ABER: Manche Ausgaben setzen auch die CHOR-Klammer geschweift! Entscheid:
+    //    Ein Chorpaar hat zwischen den zwei Systemen (oder darunter) Liedtext
+    //    (breite satzlange Zeilen), ein Klavierpaar nur kurze Dynamik/Tempo.
+    const LYRIC_SPAN_FRAC = 0.3;   // Zeile muss >= 30% der Systembreite umspannen
+    const LYRIC_MIN_ROWS = 4;
+    const labelRows = new Uint8Array(height);
+    const countWideRows = (y0: number, y1: number, spanMin: number): { wide: number; rows: number } => {
+      let wide = 0, rows = 0;
+      for (let y = Math.max(0, Math.floor(y0)); y <= Math.min(height - 1, Math.floor(y1)); y++) {
+        let rMin = width, rMax = -1;
+        const rowOff = y * width;
+        for (let x = 0; x < width; x++) {
+          if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
+            if (x < rMin) rMin = x;
+            if (x > rMax) rMax = x;
+          }
+        }
+        if (rMax >= rMin) {
+          rows++;
+          if ((rMax - rMin + 1) >= spanMin) wide++;
+        }
+      }
+      return { wide, rows };
+    };
+
+    const isPiano: boolean[] = staves.map(() => false);
+    for (const br of curlyBrackets) {
+      const coveredIdx: number[] = [];
+      for (let i = 0; i < staves.length; i++) {
+        const centerY = (staves[i].y1 + staves[i].y5) / 2;
+        if (centerY >= br.minY - bracketTolerance && centerY <= br.maxY + bracketTolerance) {
+          coveredIdx.push(i);
+        }
+      }
+
+      let vocal = false;
+      let pianoByFiller = false;
+      let lyricEvidence = 0;
+      if (coveredIdx.length === 2) {
+        const up = staves[coveredIdx[0]];
+        const lo = staves[coveredIdx[1]];
+        const spanX = Math.max(up.maxX, lo.maxX) - Math.min(up.minX, lo.minX);
+        // Schluessel: die QUOTE breiter Zeilen im Paar-Zwischenraum.
+        // Klavier durchmusiziert den Raum (nahezu jede Zeile breit, >= 80%),
+        // Liedtext besetzt nur wenige Teilzeilen (4 Zeilen bis ~70%).
+        const band1 = countWideRows(up.y5 + 1, lo.y1 - 1, spanX * LYRIC_SPAN_FRAC);
+        const belowLyrics = countWideRows(lo.y5 + 1, lo.y5 + 1 + globalAvgSpatium * 6, spanX * LYRIC_SPAN_FRAC);
+        const wideFrac = band1.rows > 0 ? band1.wide / band1.rows : 0;
+        pianoByFiller = wideFrac >= 0.8;
+        lyricEvidence = band1.wide + belowLyrics.wide;
+        vocal = !pianoByFiller && (band1.wide + belowLyrics.wide) >= LYRIC_MIN_ROWS;
+      }
+
+      // Signal 2: Beschriftungs-Spalte links der Klammer. In der Chorpartitur-
+    // Praxis steht 'Piano' allein und zentriert auf Klammer-Mitte; Stimmnamen
+    // (Soprano/Alto/Tenor/Bass) stehen an den System-Mitten der Vokalsysteme.
+    let labelPiano = false;
+    if (coveredIdx.length === 2) {
+      const braceCenter = (br.minY + br.maxY) / 2;
+      const labelX0 = Math.max(0, Math.floor(br.minX - globalAvgSpatium * 14));
+      const labelX1 = Math.max(0, Math.floor(br.minX - 1));
+      for (let y = Math.max(0, Math.floor(br.minY - globalAvgSpatium)); y <= Math.min(height - 1, Math.ceil(br.maxY + globalAvgSpatium)); y++) {
+        // einfache Cluster-Vertikalstruktur der Label-Spalte
+        let b = 0;
+        const rowOff = y * width;
+        for (let x = labelX0; x < labelX1; x++) b += binaryMap[rowOff + x];
+        labelRows[y] = b > 0 ? 1 : 0;
+      }
+      // Cluster in der Label-Spalte
+      const labelClusters2: { start: number; end: number }[] = [];
+      let lr = -1;
+      for (let y = Math.max(0, Math.floor(br.minY - globalAvgSpatium)); y <= Math.min(height - 1, Math.ceil(br.maxY + globalAvgSpatium)); y++) {
+        if (labelRows[y]) { if (lr === -1) lr = y; }
+        else if (lr !== -1) { labelClusters2.push({ start: lr, end: y - 1 }); lr = -1; }
+      }
+      if (lr !== -1) labelClusters2.push({ start: lr, end: Math.ceil(br.maxY + globalAvgSpatium) });
+      labelPiano = labelClusters2.some(lc =>
+        Math.abs(((lc.start + lc.end) / 2) - braceCenter) <= globalAvgSpatium * 2.5 &&
+        (lc.end - lc.start) >= globalAvgSpatium * 0.8);
+    }
+
+    const decisionPiano = labelPiano || pianoByFiller ? true : !vocal;
+    keepRegionsStats += `  Klammerpaar Y ${br.minY}-${br.maxY}: labelPiano=${labelPiano ? 'ja' : 'nein'}, quote=${pianoByFiller ? '>=0.8' : '<0.8'}, lyricsRows=${lyricEvidence}, -> ${decisionPiano ? 'KLAVIER' : 'CHOR'}\n`;
+    if (decisionPiano) {
+      for (const i of coveredIdx) isPiano[i] = true;
+    }
+    }
+
+    // b) Leere Zeilen-Bänder zwischen zwei Y-Werten finden (Weißraum-Analyse).
+    // Akkolade-Linie/Klammer-Ränder erzeugen nur wenige schwarze Pixel pro Zeile
+    // und fallen unter den Schwellwert, Text und Noten liegen deutlich darüber.
+    const EMPTY_ROW_MAX_BLACK = Math.max(6, Math.floor(width * 0.003));
+    type EmptyBand = { start: number; end: number; size: number };
+    const findEmptyBands = (yFrom: number, yTo: number): EmptyBand[] => {
+      const bands: EmptyBand[] = [];
+      const from = Math.max(0, Math.floor(yFrom));
+      const to = Math.min(height - 1, Math.floor(yTo));
+      let runStart = -1;
+      for (let y = from; y <= to; y++) {
+        let black = 0;
+        const rowOff = y * width;
+        for (let x = 0; x < width; x++) black += binaryMap[rowOff + x];
+        if (black <= EMPTY_ROW_MAX_BLACK) {
+          if (runStart === -1) runStart = y;
+        } else if (runStart !== -1) {
+          bands.push({ start: runStart, end: y - 1, size: y - runStart });
+          runStart = -1;
+        }
+      }
+      if (runStart !== -1) bands.push({ start: runStart, end: to, size: to + 1 - runStart });
+      return bands;
+    };
+
+    // c2) Inhalts-Cluster zwischen zwei Y-Werten (Invertierung der Lücken-Analyse,
+    // z. B. Titel-/Textblöcke zwischen den Systemen)
+    type ContentCluster = { start: number; end: number; size: number; maxLine: number };
+    const findContentClusters = (yFrom: number, yTo: number): ContentCluster[] => {
+      const clusters: ContentCluster[] = [];
+      const from = Math.max(0, Math.floor(yFrom));
+      const to = Math.min(height - 1, Math.floor(yTo));
+      let runStart = -1;
+      for (let y = from; y <= to; y++) {
+        let black = 0;
+        const rowOff = y * width;
+        for (let x = 0; x < width; x++) black += binaryMap[rowOff + x];
+        if (black > EMPTY_ROW_MAX_BLACK) {
+          if (runStart === -1) runStart = y;
+        } else if (runStart !== -1) {
+          clusters.push({ start: runStart, end: y - 1, size: y - runStart, maxLine: y - runStart });
+          runStart = -1;
+        }
+      }
+      if (runStart !== -1) clusters.push({ start: runStart, end: to, size: to + 1 - runStart, maxLine: to + 1 - runStart });
+      return clusters;
+    };
+
+    // c1b) Absatz-Cluster: Textzeilen, die enger als 2.5 Spatia beieinanderliegen,
+    // zu Inhaltsblöcken verschmelzen (ein mehrzeiliger Titel ist EIN Block).
+    const MERGE_GAP_SP = 2.5;
+    // Fettdruck-Display-Titel: mindestens eine Zeile ~2 Spatia hoch, Block >= 2.5.
+    // Kleine Untertitel/Liedtitel (~1-1.3 Spatia Zeilen) loesen nicht aus.
+    // Geometriebasierte Titel-/Copyright-Erkennung (schriftgrößenunabhängig)
+    const DISPLAY_LINE_SP = 1.8;          // Fettdruck-Versalzeile ~2 Spatia
+    const DISPLAY_BLOCK_SP = 2.5;         // Block mit solcher Zeile
+    const ZONE_TEXT_MIN_SP = 8;           // Summe der Texthöhen für eine Titelzone
+    const ZONE_COVERAGE = 0.25;           // mind. 25% der Zone mit Text bedeckt
+    const BOTTOM_GATE = 0.7;              // untere 30% der Seite: kein neuer Titel
+    const COPYRIGHT_MIN_W_FRAC = 0.35;    // breite, flache Zeile = Copyright
+    const ZONE_MIN_W_FRAC = 0.22;         // Titelzone: mind. eine Zeile so breit (% Seitenbreite)
+    const TITLE_ZONE_MIN_MM = 22;           // Titelzone: Höhe in mm (Geisterblocks Liedtext+Dynamik ~7-10mm)
+    const DETACH_SP = 1.8;                // Titel haengt nie am Satz: echter Abstand noetig
+    const findMergedClusters = (yFrom: number, yTo: number): ContentCluster[] => {
+      const maxGap = globalAvgSpatium * MERGE_GAP_SP;
+      const fine = findContentClusters(yFrom, yTo);
+      const merged: ContentCluster[] = [];
+      for (const cl of fine) {
+        const last = merged[merged.length - 1];
+        if (last && cl.start - last.end <= maxGap) {
+          last.end = cl.end;
+          last.size = last.end - last.start;
+          if (cl.maxLine > last.maxLine) last.maxLine = cl.maxLine;
+        } else {
+          merged.push({ ...cl });
+        }
+      }
+      return merged;
+    };
+
+    // Hilfsregeln für Titel-/Copyright-Erkennung (Geometrie, kein OCR)
+    // Breiten-Metrik eines Clusters: entscheidend ist die breiteste EINZELNE Zeile
+    // (maxSpan). Eine Union über Zeilen würde Kaestchen+nebeneinanderstehende
+    // Dynamik faelschlich als breit werten (16-Box | mf).
+    const clusterMetrics = (cl: ContentCluster): { width: number; maxSpan: number } => {
+      let cx0 = width, cx1 = -1, maxSpan = 0;
+      for (let y = Math.max(0, cl.start); y <= Math.min(height - 1, cl.end); y++) {
+        const rowOff = y * width;
+        let rowMin = width, rowMax = -1;
+        for (let x = 0; x < width; x++) {
+          if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
+            if (x < rowMin) rowMin = x;
+            if (x > rowMax) rowMax = x;
+          }
+        }
+        if (rowMax >= rowMin) {
+          if (rowMin < cx0) cx0 = rowMin;
+          if (rowMax > cx1) cx1 = rowMax;
+          const span = rowMax - rowMin + 1;
+          if (span > maxSpan) maxSpan = span;
+        }
+      }
+      return { width: cx1 >= cx0 ? (cx1 - cx0 + 1) : 0, maxSpan };
+    };
+    const clusterWidth = (cl: ContentCluster): number => clusterMetrics(cl).width;
+
+    const isDisplayTitle = (cl: ContentCluster) =>
+      cl.size >= globalAvgSpatium * DISPLAY_BLOCK_SP && cl.maxLine >= globalAvgSpatium * DISPLAY_LINE_SP &&
+      clusterMetrics(cl).maxSpan >= width * 0.05; // breiteste EINZELNE Zeile: Titelzeilen sind breit, Kaestchen schmal
+
+    // Eine echte Titelzone hat irgendeine breite Zeile (Titel/Untertitel/Absatz);
+    // Kästchen+Dynamik-Paeckchen im Graben sind nur 2-5% breit.
+    const hasWideLine = (clusters: ContentCluster[]) =>
+      clusters.some(cl => clusterMetrics(cl).maxSpan >= width * ZONE_MIN_W_FRAC);
+
+    const isWideShallowLine = (cl: ContentCluster, maxHsp: number, staffSpanX: number) =>
+      cl.start >= height * BOTTOM_GATE &&
+      cl.size < globalAvgSpatium * maxHsp &&
+      clusterWidth(cl) > staffSpanX * COPYRIGHT_MIN_W_FRAC;
+
+    // c) Zusammenhängende Läufe von behaltenen Systemen bilden (Klavier trennt)
+    type Run = { staves: typeof staves; startIdx: number; endIdx: number };
+    const runs: Run[] = [];
+    let currentRun: Run | null = null;
+    staves.forEach((staff, idx) => {
+      if (!isPiano[idx]) {
+        if (!currentRun) {
+          currentRun = { staves: [staff], startIdx: idx, endIdx: idx };
+          runs.push(currentRun);
+        } else {
+          currentRun.staves.push(staff);
+          currentRun.endIdx = idx;
+        }
+      } else {
+        currentRun = null;
+      }
+    });
+
+    // d) Segmentgrenzen bestimmen
+    type Segment = { top: number; bottom: number; staffCount: number; startIdx: number; endIdx: number;
+                     firstY1: number; lastY5: number; firstMinX: number; lastMinX: number; minX: number; maxX: number; newPiece: boolean; pseudo?: boolean };
+    const segments: Segment[] = [];
+
+    for (const run of runs) {
+      const firstStaff = run.staves[0];
+      const lastStaff = run.staves[run.staves.length - 1];
+      // Läufe werden nur von Klavier-Systemen getrennt, daher gilt:
+      const prevStaff = run.startIdx > 0 ? staves[run.startIdx - 1] : null; // immer Klavier
+      const nextStaff = run.endIdx < staves.length - 1 ? staves[run.endIdx + 1] : null; // immer Klavier
+
+      // Oberkante: knapp unterhalb der ersten echten Weißraum-Band unter dem
+      // vorherigen Klavier-System. So bleiben Übungszeichen/Tempoangaben, die
+      // frei über dem Vokal-System schweben, im Segment erhalten.
+      let segTop: number;
+      let newPiece = false;
+      if (!prevStaff) {
+        // Seitenanfang: auf Seite 1 Kopfzeile/Titel mitnehmen, sonst Standardrand.
+        // Ab Seite 2: steht da ein mehrzeiliger Titel (neues Stück im Heft), mitnehmen.
+        if (pageIndex === 1) {
+          segTop = 0;
+        } else {
+          // Kopfbereich: reine Textzone ohne Notenlinien. Ab ~20 Spatia Höhe
+          // (Titelvorspann) ODER Fettdruck-Block dabei -> neuer Stückbeginn.
+          // Nie in den unteren 30% (dort steht Copyright, kein Titel).
+          // Fenster endet 1 Spatium ueber dem System (Notenlinien haben 2-4px
+          // Dicke) und der Block muss vom System ABGELÖST stehen (sonst ist es
+          // Satz: Übungszeichen, Dynamik, Bogen, Seitenzahl in einer Zeile).
+          const scanFrom = Math.max(0, Math.floor(firstStaff.y1 - globalAvgSpatium * 50));
+          const scanTo = Math.floor(firstStaff.y1 - Math.ceil(globalAvgSpatium));
+          const headClusters = findMergedClusters(scanFrom, scanTo);
+          const detachedBelow = headClusters.length === 0 ||
+            headClusters[headClusters.length - 1].end <= firstStaff.y1 - globalAvgSpatium * DETACH_SP;
+          const headStart = headClusters.length > 0 && detachedBelow ? headClusters[0].start : 0;
+          const headSpan = headClusters.length > 0 && detachedBelow ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
+          const sumH = detachedBelow ? headClusters.reduce((s, cl) => s + cl.size, 0) : 0;
+          const coverage = headSpan > 0 ? sumH / headSpan : 0;
+          // Dicht gepackte Textzone (viel Text auf engem Raum) = Titelvorspann;
+          // vereinzelte Kopf-/Tempozeilen mit grossen Abständen dagegen nicht
+          const headSpanMm = headSpan * mmPerPx;
+          const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
+            ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters) && headSpanMm >= TITLE_ZONE_MIN_MM));
+          if (isPieceHead) {
+            newPiece = true;
+            segTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
+            keepRegionsStats += `  [TITEL-Kopf? start=${headStart} span=${headSpan.toFixed(0)} sumH=${sumH.toFixed(0)} cov=${coverage.toFixed(2)}]\n`;
+          } else {
+            segTop = Math.max(0, Math.floor(firstStaff.y1 - topMargin));
+          }
+        }
+      } else {
+        // Titelerkennung im Graben: hohe reine Textzone (~15+ Spatia) ODER
+        // Fettdruck-Block = neuer Titel. Nie in den unteren 30% der Seite.
+        // Fenster beginnt 1 Spatium unter dem Klavier (Liniendicke) und ein
+        // Kandidat muss vom Klavier ABGELÖST stehen – sonst ist es Musik
+        // (Haltebögen, tiefe Bassnoten, Kästchen-Kette darunter).
+        const gapClusters = findMergedClusters(prevStaff.y5 + Math.ceil(globalAvgSpatium), firstStaff.y1 - 1);
+        const gapStart = gapClusters.length > 0 ? gapClusters[0].start : 0;
+        const gapSpan = gapClusters.length > 0 ? gapClusters[gapClusters.length - 1].end - gapStart + 1 : 0;
+        const gatedByPosition = gapClusters.length > 0 && gapStart < height * BOTTOM_GATE;
+        const detachedAbove = gapClusters.length > 0 && gapStart - prevStaff.y5 >= globalAvgSpatium * DETACH_SP;
+        const sumH = detachedAbove ? gapClusters.reduce((s, cl) => s + cl.size, 0) : 0;
+        const coverage = gapSpan > 0 ? sumH / gapSpan : 0;
+        const zoneTitle = gatedByPosition && detachedAbove && gapClusters.length > 0 && sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(gapClusters) && gapSpan * mmPerPx >= TITLE_ZONE_MIN_MM;
+        const titleStart = zoneTitle ? gapStart : null;
+
+        if (pageIndex > 1 && titleStart !== null) {
+          newPiece = true;
+          segTop = Math.max(Math.floor(prevStaff.y5 + globalAvgSpatium), Math.floor(titleStart - globalAvgSpatium));
+          keepRegionsStats += `  [TITEL-Graben? start=${titleStart} span=${gapSpan.toFixed(0)} sumH=${sumH.toFixed(0)} cov=${coverage.toFixed(2)} detach=${detachedAbove}]\n`;
+        } else {
+        // Schnitt in die LETZTE große Lücke vor dem Vokal-System (die Luft direkt
+        // darüber): Alles, was am Klavier klebt – tiefe Basstöne mit Hilfslinien,
+        // Pedalmarken, Klammer – liegt oberhalb dieser Lücke und fällt weg; alles,
+        // was am Vokal-System klebt (Liedtext, Dynamik, Übungszeichen), liegt
+        // unterhalb ihres unteren Endes und bleibt erhalten.
+        const topBands = findEmptyBands(prevStaff.y5 + 1, firstStaff.y1 - 1).filter(b => b.size >= globalAvgSpatium * 1.5);
+        const lastBand = topBands[topBands.length - 1];
+        if (lastBand) {
+          const desired = Math.floor(firstStaff.y1 - globalAvgSpatium * 2);
+          // Wunschposition 2 Spatia über dem System, falls sie in der Lücke liegt;
+          // sonst knapp unterhalb der Lücke (direkt über dem vokalen Inhalt).
+          segTop = (desired >= lastBand.start && desired <= lastBand.end) ? desired : lastBand.end + 1;
+          segTop = Math.min(segTop, Math.floor(firstStaff.y1 - 1));
+          segTop = Math.max(segTop, Math.floor(prevStaff.y5 + globalAvgSpatium));
+        } else {
+          segTop = Math.max(Math.floor(prevStaff.y5 + globalAvgSpatium), Math.floor(firstStaff.y1 - globalAvgSpatium * 4.5));
+        }
+
+        }
+      }
+
+      // Unterkante: Mitte der größten Weißraum-Lücke zum nächsten Klavier-System,
+      // damit Liedtext unter dem letzten Vokal-System erhalten bleibt.
+      let segBottom: number;
+      if (!nextStaff) {
+        segBottom = Math.min(height, Math.ceil(lastStaff.y5 + safeMargin));
+      } else {
+        const bottomBands = findEmptyBands(lastStaff.y5 + 1, nextStaff.y1 - 1);
+        const bestBand = bottomBands.filter(b => b.size >= globalAvgSpatium * 2).sort((a, b) => b.size - a.size)[0];
+        if (bestBand) {
+          segBottom = bestBand.start + Math.floor(bestBand.size / 2);
+          segBottom = Math.min(segBottom, Math.floor(nextStaff.y1 - globalAvgSpatium));
+          segBottom = Math.max(segBottom, Math.ceil(lastStaff.y5 + globalAvgSpatium * 2));
+        } else {
+          segBottom = Math.min(Math.floor(nextStaff.y1 - globalAvgSpatium), Math.ceil(lastStaff.y5 + safeMargin));
+        }
+
+      }
+
+      const top = Math.max(0, Math.floor(segTop));
+      const bottom = Math.min(height, Math.ceil(segBottom));
+      if (bottom > top) {
+        segments.push({
+          top, bottom, staffCount: run.staves.length, startIdx: run.startIdx, endIdx: run.endIdx,
+          firstY1: firstStaff.y1, lastY5: lastStaff.y5, firstMinX: firstStaff.minX, lastMinX: lastStaff.minX,
+          minX: Math.min(...run.staves.map(s => s.minX)), maxX: Math.max(...run.staves.map(s => s.maxX)),
+          newPiece
         });
       }
-      
-      // If we filtered out ALL staves (meaning the system ONLY had curly brackets),
-      // we skip this akkolade entirely as per the user's request: "Schneid es einfach immer weg."
-      if (keepStaves.length === 0) {
-          keepRegionsStats += `  Region ${i+1}: NUR PIANO (übersprungen)\n`;
-          continue;
-      } else {
-          keepRegionsStats += `  Region ${i+1}: CHOR (${keepStaves.length} Systeme)\n`;
+    }
+
+    // c3) Frontmatter/Titel am Seitenanfang: steht über einem reinen Klavier-Intro
+    // ein grosser Titelblock (ab Seite 2 -> neues Stück im Heft), wird er als
+    // eigener Streifen davor ausgegeben. Titel bleibt, Klavier-Intro bleibt weg.
+    if (pageIndex > 1 && staves.length > 0 && isPiano[0] && segments.length > 0) {
+      // Kein Detach-Gate hier: direkt ueber dem Klavier-Intro ist der
+      // Tempo-Vermerk Satz gehoerig und gehoert zum Titelvorspann dazu.
+      const headClusters = findMergedClusters(0, Math.floor(staves[0].y1 - Math.ceil(globalAvgSpatium)));
+      const headStart = headClusters.length > 0 ? headClusters[0].start : 0;
+      const headSpan = headClusters.length > 0 ? headClusters[headClusters.length - 1].end - headStart + 1 : 0;
+      const sumH = headClusters.reduce((s, cl) => s + cl.size, 0);
+      const coverage = headSpan > 0 ? sumH / headSpan : 0;
+      const isPieceHead = headClusters.length > 0 && headStart < height * BOTTOM_GATE &&
+        ((sumH >= globalAvgSpatium * ZONE_TEXT_MIN_SP && coverage >= ZONE_COVERAGE && hasWideLine(headClusters) && headSpan * mmPerPx >= TITLE_ZONE_MIN_MM));
+      keepRegionsStats += `  [KOPF-VORSPANN? start=${headStart} span=${headSpan.toFixed(0)} sumH=${sumH.toFixed(0)} cov=${coverage.toFixed(2)} fire=${isPieceHead ? 'ja' : 'nein'}]\n`;
+      if (isPieceHead) {
+        const fTop = Math.max(0, Math.floor(headStart - globalAvgSpatium));
+        const fBottom = Math.min(height, Math.floor(staves[0].y1 - globalAvgSpatium));
+        if (fBottom > fTop) {
+          segments.unshift({
+            top: fTop, bottom: fBottom, staffCount: 0, startIdx: -1, endIdx: -1,
+            firstY1: staves[0].y1, lastY5: staves[0].y5, firstMinX: staves[0].minX, lastMinX: staves[0].minX,
+            minX: staves[0].minX, maxX: staves[0].maxX, newPiece: true, pseudo: true
+          });
+          // Seitenumbruch nur einmal pro Quellseite: der Chortitel darunter
+          // erzwingt dann keinen zweiten Umbruch
+          for (const s of segments) if (!s.pseudo) s.newPiece = false;
+        }
       }
+    }
 
-      const highestKeepStaff = keepStaves[0];
-      const lowestKeepStaff = keepStaves[keepStaves.length - 1];
-      
-      let keepStartY = Math.max(0, highestKeepStaff.y1 - topMargin);
-      let keepEndY = Math.min(height, lowestKeepStaff.y5 + safeMargin);
+    // e) Streifen erzeugen (mit X-Zuschnitt auf den tatsächlichen Inhalt) +
+    //    Schnittlinien im Debug-Bild (rot, oben und unten)
+    for (const seg of segments) {
+      const h = seg.bottom - seg.top;
 
-      if (i === 0 && pageIndex === 1) {
-        // Keep from top of page for the very first akkolade to preserve the title/header
-        keepStartY = 0;
-      }
-
-      const h = keepEndY - keepStartY;
-      if (h > 0) {
-          const stripCanvas = document.createElement('canvas');
-          stripCanvas.width = width;
-          stripCanvas.height = h;
-          const stripCtx = stripCanvas.getContext('2d')!;
-          stripCtx.fillStyle = 'white';
-          stripCtx.fillRect(0, 0, width, h);
-          stripCtx.drawImage(canvas, 0, keepStartY, width, h, 0, 0, width, h);
-          croppedStrips.push({ dataUrl: stripCanvas.toDataURL('image/jpeg', 0.9), height: h });
-          keepRegionsStats += `  Region ${i+1}: Y ${Math.floor(keepStartY)} bis ${Math.floor(keepEndY)} (Staves kept: ${keepStaves.length})\n`;
-
-          // Draw a thick red line at the cut point on the debug image for visual feedback
-          for (let y = Math.floor(keepEndY) - 2; y <= Math.floor(keepEndY) + 2; y++) {
-             for (let x = 0; x < width; x++) {
-                if (y >= 0 && y < height) {
-                   const idx = (y * width + x) * 4;
-                   data[idx] = 255; data[idx+1] = 0; data[idx+2] = 0;
-                }
-             }
+      // Inhaltsgrenzen links/rechts bestimmen (Klammern, Stimmnamen, Taktnummern).
+      // Seitenrahmen des Verlags (fast durchgehend schwarze Spalten) zählen nicht.
+      let contentLeft = -1;
+      let contentRight = -1;
+      const leftScanEnd = Math.max(0, Math.floor(seg.minX));
+      const rightScanStart = Math.min(width, Math.ceil(seg.maxX));
+      for (let y = seg.top; y < seg.bottom; y++) {
+        const rowOff = y * width;
+        for (let x = 0; x < leftScanEnd; x++) {
+          if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
+            if (contentLeft === -1 || x < contentLeft) contentLeft = x;
           }
+        }
+        for (let x = rightScanStart; x < width; x++) {
+          if (binaryMap[rowOff + x] === 1 && !frameCols[x]) {
+            if (x > contentRight) contentRight = x;
+          }
+        }
+      }
+
+      const padX = globalAvgSpatium;
+      let cropX0: number, cropX1: number;
+      if (seg.pseudo) {
+        // Titel-/Textstreifen: frei auf den Inhalt zuschneiden (keine Systeme)
+        cropX0 = contentLeft >= 0 ? Math.max(0, Math.floor(contentLeft - padX)) : 0;
+        cropX1 = contentRight >= 0 ? Math.min(width, Math.ceil(contentRight + padX)) : width;
+      } else {
+        cropX0 = contentLeft >= 0 ? contentLeft - padX : seg.minX - 3 * globalAvgSpatium;
+        cropX1 = contentRight >= 0 ? contentRight + padX : seg.maxX + 2 * globalAvgSpatium;
+        // Sanity: nie in die Systeme hinein schneiden, Ausreißer abfangen
+        cropX0 = Math.min(Math.max(0, Math.floor(cropX0)), Math.floor(seg.minX - globalAvgSpatium * 0.5));
+        cropX1 = Math.max(Math.min(width, Math.ceil(cropX1)), Math.ceil(seg.maxX + globalAvgSpatium * 0.5));
+        if (seg.minX - cropX0 > globalAvgSpatium * 30) cropX0 = Math.floor(seg.minX - 3 * globalAvgSpatium);
+        if (cropX1 - seg.maxX > globalAvgSpatium * 30) cropX1 = Math.ceil(seg.maxX + 2 * globalAvgSpatium);
+      }
+
+      // Streifen in Ausgabe-Auflösung zeichnen (Koordinaten -> Ausgabe-Raum)
+      const outX0 = Math.floor(cropX0 * outScale);
+      const outX1 = Math.ceil(cropX1 * outScale);
+      const outW = outX1 - outX0;
+      const outTop = Math.floor(seg.top * outScale);
+      const outH = Math.max(1, Math.ceil(seg.bottom * outScale) - outTop);
+
+      const stripCanvas = document.createElement('canvas');
+      stripCanvas.width = outW;
+      stripCanvas.height = outH;
+      const stripCtx = stripCanvas.getContext('2d')!;
+      stripCtx.fillStyle = 'white';
+      stripCtx.fillRect(0, 0, outW, outH);
+      stripCtx.drawImage(outCanvas, outX0, outTop, outW, outH, 0, 0, outW, outH);
+
+      // Überhängende Reste des Akkoladen-Verbunds weiss übermalen – nicht über
+      // fixe X-Bänder (die passen nur, wenn Strich/Klammer genau bei minX sitzen),
+      // sondern pixelgenau: Spalten in der Schnittzone, die dort durchgehend
+      // schwarz sind (>= 70% der Zonenzeilen), sind per Definition Überrest.
+      const bottomZoneStart = Math.floor(seg.lastY5 * outScale) - outTop + Math.ceil(3 * outScale);
+      const topZoneEnd = Math.floor(seg.firstY1 * outScale) - outTop - Math.ceil(2 * outScale);
+      stripCtx.fillStyle = 'white';
+
+      const detectDangleCols = (zoneStart: number, zoneEnd: number): number[] => {
+        const cols: number[] = [];
+        const z0 = Math.max(0, Math.floor(zoneStart));
+        const z1 = Math.min(height - 1, Math.floor(zoneEnd));
+        const zoneH = z1 - z0 + 1;
+        if (zoneH <= 0) return cols;
+        const x0 = Math.max(0, Math.floor(seg.minX - globalAvgSpatium * 2.5));
+        const x1 = Math.min(width - 1, Math.ceil(Math.max(seg.firstMinX, seg.lastMinX) + 3));
+        for (let x = x0; x <= x1; x++) {
+          let black = 0;
+          for (let y = z0; y <= z1; y++) {
+            if (binaryMap[y * width + x] === 1) black++;
+          }
+          if (black / zoneH >= 0.7) cols.push(x);
+        }
+        return cols;
+      };
+      const eraseCols = (cols: number[], zoneOutStart: number, zoneOutEnd: number) => {
+        for (const col of cols) {
+          const bx = Math.floor(col * outScale) - outX0;
+          const w = Math.ceil(2 * outScale) + 1;
+          stripCtx.fillRect(Math.max(0, bx - Math.floor(w / 2)), zoneOutStart, w, Math.max(0, zoneOutEnd - zoneOutStart));
+        }
+      };
+
+      if (!seg.pseudo && bottomZoneStart < outH) {
+        eraseCols(detectDangleCols(seg.lastY5 + 2, seg.bottom - 1), bottomZoneStart, outH);
+      }
+      if (!seg.pseudo && topZoneEnd > 0 && !(pageIndex === 1 && seg.top === 0)) {
+        eraseCols(detectDangleCols(seg.top + 1, seg.firstY1 - 2), 0, topZoneEnd);
+      }
+
+      // Optional: 1-Bit Schwarz-Weiss (gestochen scharfe Kanten, kleine PNG-Datei,
+      // Grauschleier aus Scans wird zu reinem Weiss)
+      if (outBilevel) {
+        const img = stripCtx.getImageData(0, 0, outW, outH);
+        const px = img.data;
+        for (let p = 0; p < px.length; p += 4) {
+          const lum = 0.299 * px[p] + 0.587 * px[p + 1] + 0.114 * px[p + 2];
+          const v = lum < 200 ? 0 : 255;
+          px[p] = v; px[p + 1] = v; px[p + 2] = v; px[p + 3] = 255;
+        }
+        stripCtx.putImageData(img, 0, 0);
+      }
+
+      croppedStrips.push({
+        dataUrl: outBilevel ? stripCanvas.toDataURL('image/png') : stripCanvas.toDataURL('image/jpeg', 0.92),
+        height: outH,
+        width: outW,
+        // Naturmaße in Millimetern (unabhängig von der Ausgabe-Auflösung)
+        widthMm: (outW / outScale) * mmPerPx,
+        heightMm: (outH / outScale) * mmPerPx,
+        newPiece: seg.newPiece
+      });
+
+      // Rote Schnittlinien an Ober-/Unterkante im Debug-Bild
+      for (const lineY of [seg.top, seg.bottom]) {
+        for (let y = lineY - 2; y <= lineY + 2; y++) {
+          if (y < 0 || y >= height) continue;
+          for (let x = 0; x < width; x++) {
+            const i = (y * width + x) * 4;
+            data[i] = 255; data[i + 1] = 0; data[i + 2] = 0;
+          }
+        }
+      }
+    }
+
+    // f) Stats: Titel-Streifen und Segmente/Klavier-Läufe protokollieren
+    const realSegs = segments.filter(s => !s.pseudo);
+    segments.filter(s => s.pseudo).forEach((seg, k) => {
+      keepRegionsStats += `  -> TITEL-Streifen ${k + 1}: neue Seite, Y ${seg.top} bis ${seg.bottom}  [NEUES STUECK -> Seitenumbruch]\n`;
+    });
+    segNumLoop: {
+      let pianoRunStart = -1;
+      let segIdx = 0;
+      for (let i = 0; i <= staves.length; i++) {
+        const pianoHere = i < staves.length && isPiano[i];
+        if (pianoHere && pianoRunStart === -1) {
+          pianoRunStart = i;
+        } else if (!pianoHere && pianoRunStart !== -1) {
+          keepRegionsStats += `  -> KLAVIER entfernt: ${i - pianoRunStart} System(e), Y ${Math.floor(staves[pianoRunStart].y1)} bis ${Math.floor(staves[i - 1].y5)}\n`;
+          pianoRunStart = -1;
+        }
+        if (segIdx < realSegs.length && realSegs[segIdx].startIdx === i) {
+          const seg = realSegs[segIdx];
+          keepRegionsStats += `  Segment ${segIdx + 1}: CHOR (${seg.staffCount} Systeme), Y ${seg.top} bis ${seg.bottom}${seg.newPiece ? '  [NEUES STUECK -> Seitenumbruch]' : ''}\n`;
+          segIdx++;
+        }
       }
     }
   }
 
   ctx.putImageData(imgData, 0, 0);
 
-  const debugImage = canvas.toDataURL('image/jpeg', 0.8);
+  // Debug-Bild zur Speicherschonung auf max. 1240px Breite verkleinern
+  // (bei vielen Seiten summieren sich die Daten-URLs sonst massiv)
+  const dbgScale = Math.min(1, 1240 / width);
+  let debugImage: string;
+  if (dbgScale < 1) {
+    const dbgCanvas = document.createElement('canvas');
+    dbgCanvas.width = Math.floor(width * dbgScale);
+    dbgCanvas.height = Math.floor(height * dbgScale);
+    const dbgCtx = dbgCanvas.getContext('2d')!;
+    dbgCtx.drawImage(canvas, 0, 0, dbgCanvas.width, dbgCanvas.height);
+    debugImage = dbgCanvas.toDataURL('image/jpeg', 0.8);
+    dbgCanvas.width = 0; dbgCanvas.height = 0;
+  } else {
+    debugImage = canvas.toDataURL('image/jpeg', 0.8);
+  }
   
   let stats = `Bildgröße: ${width}x${height}
 Schwarze Pixel: ${blackPixelCount}
@@ -473,7 +984,7 @@ Spatium (Durchschnitt): ${staves.length > 0 ? (staves.reduce((s, st) => s + st.s
     stats += `  Klammer ${i+1}: ${br.type} (X: ${Math.floor(br.minX)} bis ${Math.floor(br.maxX)}, Y: ${Math.floor(br.minY)} bis ${Math.floor(br.maxY)})\n`;
   });
 
-  stats += `\nSchnittbereiche (Keep Regions):\n`;
+  stats += `\nKeep-Segmente (Schnittbereiche):\n`;
   stats += keepRegionsStats;
 
   return { debugImage, stats, croppedStrips };
